@@ -1,5 +1,6 @@
 import { initializeApp } from "firebase-admin/app";
 import { getStorage } from "firebase-admin/storage";
+import type { Bucket } from "@google-cloud/storage";
 import sharp from "sharp";
 
 initializeApp();
@@ -20,32 +21,39 @@ const VARIANT_REGEX = /_\d+x\d+\.webp$/i;
 const SKIP_CONTENT_TYPES = new Set(["image/gif", "image/svg+xml"]);
 
 let processed = 0;
-let skipped = 0;
+let alreadyExisted = 0;
 let errors = 0;
 
+/**
+ * Process a single image: generate all 4 variant sizes.
+ * Returns the number of variants actually created (0-4).
+ */
 async function processImage(
   filePath: string,
-  contentType: string,
-  srcBucket: ReturnType<ReturnType<typeof getStorage>["bucket"]>,
-  dstBucket: ReturnType<ReturnType<typeof getStorage>["bucket"]>,
-) {
+  srcBucket: Bucket,
+  dstBucket: Bucket,
+): Promise<number> {
+  let created = 0;
+
   // Download
   const [buffer] = await srcBucket.file(filePath).download();
 
   if (!buffer || buffer.length === 0) {
-    skipped++;
-    return;
+    return 0;
   }
 
   const basePath = filePath.replace(/\.[^.]+$/, "");
 
-  await Promise.allSettled(
+  const results = await Promise.allSettled(
     SIZES.map(async (size) => {
       const variantPath = `${basePath}_${size.suffix}.webp`;
 
-      // Skip if variant already exists
+      // Skip if variant already exists (resumable backfill)
       const [exists] = await dstBucket.file(variantPath).exists();
-      if (exists) return;
+      if (exists) {
+        alreadyExisted++;
+        return;
+      }
 
       const resizedBuffer = await sharp(buffer, {
         limitInputPixels: 100_000_000,
@@ -63,8 +71,19 @@ async function processImage(
           cacheControl: "public, max-age=31536000",
         },
       });
+
+      created++;
     }),
   );
+
+  // Log any size-level failures
+  for (const result of results) {
+    if (result.status === "rejected") {
+      console.error(`  Size failed for ${filePath}:`, result.reason);
+    }
+  }
+
+  return created;
 }
 
 async function main() {
@@ -88,10 +107,10 @@ async function main() {
 
     page++;
     console.log(
-      `Page ${page}: ${files.length} files (processed: ${processed}, skipped: ${skipped}, errors: ${errors})`,
+      `Page ${page}: ${files.length} files listed (created: ${processed}, skipped: ${alreadyExisted}, errors: ${errors})`,
     );
 
-    // Filter to images only
+    // Filter to images only (mirrors the live Cloud Function guards)
     const imageFiles = files.filter((file) => {
       const name = file.name;
       const contentType = file.metadata.contentType || "";
@@ -104,33 +123,41 @@ async function main() {
       return true;
     });
 
-    // Process in parallel batches
-    const batchSize = Math.min(CONCURRENCY, imageFiles.length);
-    for (let i = 0; i < imageFiles.length; i += batchSize) {
-      const batch = imageFiles.slice(i, i + batchSize);
-      await Promise.allSettled(
-        batch.map(async (file) => {
-          try {
-            await processImage(
-              file.name,
-              file.metadata.contentType || "image/jpeg",
-              srcBucket,
-              dstBucket,
-            );
-            processed++;
-          } catch (err) {
-            errors++;
-            console.error(`Error processing ${file.name}:`, err);
-          }
-        }),
-      );
+    if (imageFiles.length === 0) {
+      pageToken = nextPageToken as string | undefined;
+      continue;
     }
 
-    pageToken = nextPageToken;
+    // Process in parallel batches of CONCURRENCY
+    for (let i = 0; i < imageFiles.length; i += CONCURRENCY) {
+      const batch = imageFiles.slice(i, i + CONCURRENCY);
+      const results = await Promise.allSettled(
+        batch.map(async (file) => {
+          const created = await processImage(file.name, srcBucket, dstBucket);
+          if (created > 0) processed++;
+          return created;
+        }),
+      );
+
+      // Count hard errors
+      for (const r of results) {
+        if (r.status === "rejected") {
+          errors++;
+        }
+      }
+    }
+
+    pageToken = nextPageToken as string | undefined;
   } while (pageToken);
 
   console.log("");
-  console.log(`Done! Processed: ${processed}, Skipped: ${skipped}, Errors: ${errors}`);
+  console.log("=== Backfill complete ===");
+  console.log(`  Variants created for: ${processed} images`);
+  console.log(`  Already existed:       ${alreadyExisted} sizes skipped`);
+  console.log(`  Errors:                ${errors}`);
 }
 
-main().catch(console.error);
+main().catch((err) => {
+  console.error("Fatal error:", err);
+  process.exit(1);
+});
