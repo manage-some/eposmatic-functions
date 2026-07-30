@@ -1,5 +1,6 @@
 {
   "projects": {
-    "default": "dev-managesome"
+    "default": "dev-managesome",
+    "prod": "prod-managesome"
   }
 }

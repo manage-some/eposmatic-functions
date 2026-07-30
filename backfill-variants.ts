@@ -1,14 +1,15 @@
-import { initializeApp } from "firebase-admin/app";
-import { getStorage } from "firebase-admin/storage";
-import type { Bucket } from "@google-cloud/storage";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import sharp from "sharp";
 
-initializeApp();
-
-const SOURCE_BUCKET = process.env.SOURCE_BUCKET || "dev-managesome.appspot.com";
-const VARIANTS_BUCKET =
-  process.env.VARIANTS_BUCKET || "dev-managesome-variants";
-const CONCURRENCY = parseInt(process.env.CONCURRENCY || "30", 10);
+const PROJECT = "dev-managesome";
+const SOURCE_BUCKET = "dev-managesome.appspot.com";
+const VARIANTS_BUCKET = "dev-managesome-variants";
+const CONCURRENCY = 30;
+const TMP = join(tmpdir(), "backfill-variants");
+mkdirSync(TMP, { recursive: true });
 
 const SIZES = [
   { suffix: "64x64", width: 64, height: 64 },
@@ -18,42 +19,37 @@ const SIZES = [
 ] as const;
 
 const VARIANT_REGEX = /_\d+x\d+\.webp$/i;
-const SKIP_CONTENT_TYPES = new Set(["image/gif", "image/svg+xml"]);
 
-let processed = 0;
-let alreadyExisted = 0;
-let errors = 0;
+function gcloudStorage(args: string[]): void {
+  execFileSync("gcloud", ["storage", ...args, "--project", PROJECT], {
+    stdio: "ignore",
+    timeout: 30_000,
+  });
+}
 
-/**
- * Process a single image: generate all 4 variant sizes.
- * Returns the number of variants actually created (0-4).
- */
-async function processImage(
-  filePath: string,
-  srcBucket: Bucket,
-  dstBucket: Bucket,
-): Promise<number> {
-  let created = 0;
+async function processImage(gcsPath: string): Promise<number> {
+  const filePath = gcsPath.replace(`gs://${SOURCE_BUCKET}/`, "");
+  const basePath = filePath.replace(/\.[^.]+$/, "");
 
-  // Download
-  const [buffer] = await srcBucket.file(filePath).download();
+  // Single temp dir per image
+  const imgDir = join(TMP, Buffer.from(gcsPath).toString("base64"));
+  mkdirSync(imgDir, { recursive: true });
+  const localFile = join(imgDir, "original");
 
+  // 1 gcloud call — download
+  gcloudStorage(["cp", gcsPath, localFile]);
+
+  const buffer = readFileSync(localFile);
   if (!buffer || buffer.length === 0) {
+    rmSync(imgDir, { recursive: true, force: true });
     return 0;
   }
 
-  const basePath = filePath.replace(/\.[^.]+$/, "");
-
+  // Generate and upload all 4 variants in parallel
   const results = await Promise.allSettled(
     SIZES.map(async (size) => {
       const variantPath = `${basePath}_${size.suffix}.webp`;
-
-      // Skip if variant already exists (resumable backfill)
-      const [exists] = await dstBucket.file(variantPath).exists();
-      if (exists) {
-        alreadyExisted++;
-        return;
-      }
+      const tmpFile = join(imgDir, size.suffix);
 
       const resizedBuffer = await sharp(buffer, {
         limitInputPixels: 100_000_000,
@@ -65,95 +61,88 @@ async function processImage(
         .webp({ quality: 80 })
         .toBuffer();
 
-      await dstBucket.file(variantPath).save(resizedBuffer, {
-        metadata: {
-          contentType: "image/webp",
-          cacheControl: "public, max-age=31536000",
-        },
-      });
-
-      created++;
+      writeFileSync(tmpFile, resizedBuffer);
+      gcloudStorage(["cp", tmpFile, `gs://${VARIANTS_BUCKET}/${variantPath}`]);
     }),
   );
 
-  // Log any size-level failures
-  for (const result of results) {
-    if (result.status === "rejected") {
-      console.error(`  Size failed for ${filePath}:`, result.reason);
-    }
-  }
-
+  const created = results.filter((r) => r.status === "fulfilled").length;
+  rmSync(imgDir, { recursive: true, force: true });
   return created;
 }
 
 async function main() {
-  const storage = getStorage();
-  const srcBucket = storage.bucket(SOURCE_BUCKET);
-  const dstBucket = storage.bucket(VARIANTS_BUCKET);
-
-  console.log(`Backfilling variants from ${SOURCE_BUCKET} → ${VARIANTS_BUCKET}`);
+  console.log(
+    `Backfilling variants from ${SOURCE_BUCKET} → ${VARIANTS_BUCKET}`,
+  );
   console.log(`Concurrency: ${CONCURRENCY}`);
   console.log("");
 
-  let pageToken: string | undefined;
-  let page = 0;
+  const listResult = execFileSync(
+    "gcloud",
+    [
+      "storage",
+      "ls",
+      "--recursive",
+      `gs://${SOURCE_BUCKET}/images/**`,
+      "--project",
+      PROJECT,
+    ],
+    { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 60_000 },
+  ).trim();
 
-  do {
-    const [files, nextPageToken] = await srcBucket.getFiles({
-      autoPaginate: false,
-      maxResults: 100,
-      pageToken,
-    });
-
-    page++;
-    console.log(
-      `Page ${page}: ${files.length} files listed (created: ${processed}, skipped: ${alreadyExisted}, errors: ${errors})`,
-    );
-
-    // Filter to images only (mirrors the live Cloud Function guards)
-    const imageFiles = files.filter((file) => {
-      const name = file.name;
-      const contentType = file.metadata.contentType || "";
-
+  const allFiles = listResult
+    .split("\n")
+    .filter(Boolean)
+    .filter((line) => {
+      const name = line.trim().replace(`gs://${SOURCE_BUCKET}/`, "");
       if (!name) return false;
       if (VARIANT_REGEX.test(name)) return false;
-      if (!contentType.startsWith("image/")) return false;
-      if (SKIP_CONTENT_TYPES.has(contentType)) return false;
-
+      if (!/\.(jpg|jpeg|png|webp|bmp|tiff|tif|avif)$/i.test(name)) return false;
       return true;
     });
 
-    if (imageFiles.length === 0) {
-      pageToken = nextPageToken as string | undefined;
-      continue;
-    }
+  console.log(`Total images to process: ${allFiles.length}`);
+  console.log("");
 
-    // Process in parallel batches of CONCURRENCY
-    for (let i = 0; i < imageFiles.length; i += CONCURRENCY) {
-      const batch = imageFiles.slice(i, i + CONCURRENCY);
-      const results = await Promise.allSettled(
-        batch.map(async (file) => {
-          const created = await processImage(file.name, srcBucket, dstBucket);
-          if (created > 0) processed++;
-          return created;
-        }),
-      );
+  let processed = 0;
+  let errors = 0;
+  let batchNum = 0;
 
-      // Count hard errors
-      for (const r of results) {
-        if (r.status === "rejected") {
-          errors++;
+  for (let i = 0; i < allFiles.length; i += CONCURRENCY) {
+    batchNum++;
+    const batch = allFiles.slice(i, i + CONCURRENCY);
+
+    const results = await Promise.allSettled(
+      batch.map(async (gcsPath) => {
+        try {
+          return (await processImage(gcsPath)) > 0 ? "created" : "empty";
+        } catch (err) {
+          console.error(`  Error: ${gcsPath}`, err);
+          return "error";
         }
+      }),
+    );
+
+    for (const r of results) {
+      if (r.status === "fulfilled") {
+        if (r.value === "created") processed++;
+        else if (r.value === "error") errors++;
+      } else {
+        errors++;
       }
     }
 
-    pageToken = nextPageToken as string | undefined;
-  } while (pageToken);
+    const done = Math.min(i + CONCURRENCY, allFiles.length);
+    const pct = Math.round((done / allFiles.length) * 100);
+    console.log(
+      `Batch ${batchNum}: ${done}/${allFiles.length} (${pct}%) — created: ${processed}, errors: ${errors}`,
+    );
+  }
 
   console.log("");
   console.log("=== Backfill complete ===");
   console.log(`  Variants created for: ${processed} images`);
-  console.log(`  Already existed:       ${alreadyExisted} sizes skipped`);
   console.log(`  Errors:                ${errors}`);
 }
 
