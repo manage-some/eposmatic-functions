@@ -1,0 +1,20 @@
+{
+    "compilerOptions": {
+        "module": "esnext",
+        "moduleResolution": "bundler",
+        "target": "es2022",
+        "outDir": "build",
+        "rootDir": "src",
+        "strict": true,
+        "esModuleInterop": true,
+        "skipLibCheck": true,
+        "forceConsistentCasingInFileNames": true,
+        "resolveJsonModule": true,
+        "declaration": false,
+        "sourceMap": true
+    },
+    "include": [
+        "src/**/*"
+    ],
+    "compileOnSave": true
+}

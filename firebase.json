@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "source": ".",
+    "codebase": "image-variants",
+    "ignore": [".git", "node_modules", "tsconfig.json", "*.ts"]
+  }
+}
