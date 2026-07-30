@@ -18,7 +18,7 @@ const SIZES = [
   { suffix: "512x512", width: 512, height: 512 },
 ] as const;
 
-const VARIANT_REGEX = /_\d+x\d+\.webp$/i;
+const VARIANT_REGEX = /_\d+x\d+(\.webp)?$/i;
 
 function gcloudStorage(args: string[]): void {
   execFileSync("gcloud", ["storage", ...args, "--project", PROJECT], {
@@ -48,7 +48,9 @@ async function processImage(gcsPath: string): Promise<number> {
   // Generate and upload all 4 variants in parallel
   const results = await Promise.allSettled(
     SIZES.map(async (size) => {
-      const variantPath = `${basePath}_${size.suffix}.webp`;
+      // Only append .webp if the original had an extension
+      const variantExt = filePath.includes(".") ? ".webp" : "";
+      const variantPath = `${basePath}_${size.suffix}${variantExt}`;
       const tmpFile = join(imgDir, size.suffix);
 
       const resizedBuffer = await sharp(buffer, {
@@ -84,7 +86,7 @@ async function main() {
       "storage",
       "ls",
       "--recursive",
-      `gs://${SOURCE_BUCKET}/images/**`,
+      `gs://${SOURCE_BUCKET}/images/`,
       "--project",
       PROJECT,
     ],
@@ -98,7 +100,11 @@ async function main() {
       const name = line.trim().replace(`gs://${SOURCE_BUCKET}/`, "");
       if (!name) return false;
       if (VARIANT_REGEX.test(name)) return false;
-      if (!/\.(jpg|jpeg|png|webp|bmp|tiff|tif|avif)$/i.test(name)) return false;
+      // Include image extensions OR files with no extension at all
+      // (warehouse doesn't append extensions)
+      const hasImageExt = /\.(jpg|jpeg|png|webp|bmp|tiff|tif|avif)$/i.test(name);
+      const hasNoExt = !name.includes(".");
+      if (!hasImageExt && !hasNoExt) return false;
       return true;
     });
 

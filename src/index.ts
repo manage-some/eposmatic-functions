@@ -31,7 +31,7 @@ const SIZES = [
  * Regex to detect files that are already variants.
  * Matches filenames ending in _{digits}x{digits}.webp
  */
-const VARIANT_REGEX = /_\d+x\d+\.webp$/i;
+const VARIANT_REGEX = /_\d+x\d+(\.webp)?$/i;
 
 /** Size entry with typed fields. */
 interface SizeConfig {
@@ -144,7 +144,9 @@ export const generateImageVariants = onObjectFinalized(
       // Generate all variants in parallel (fit: "inside" preserves aspect ratio)
       const results = await Promise.allSettled(
         SIZES.map(async (size: SizeConfig) => {
-          const variantPath = `${basePath}_${size.suffix}.webp`;
+          // Only append .webp if the original had an extension
+          const variantExt = filePath.includes(".") ? ".webp" : "";
+          const variantPath = `${basePath}_${size.suffix}${variantExt}`;
 
           const resizedBuffer = await sharp(buffer, {
             limitInputPixels: 100_000_000,
@@ -259,7 +261,9 @@ export const cleanupVariants = onObjectDeleted(
     // Delete all variant files in parallel (ignore 404s)
     const results = await Promise.allSettled(
       SIZES.map(async (size: SizeConfig) => {
-        const variantPath = `${basePath}_${size.suffix}.webp`;
+        // Match the same naming logic as generateImageVariants
+        const variantExt = filePath.includes(".") ? ".webp" : "";
+        const variantPath = `${basePath}_${size.suffix}${variantExt}`;
         await variantsBucketRef.file(variantPath).delete();
         return variantPath;
       }),
