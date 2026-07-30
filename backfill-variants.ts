@@ -73,6 +73,91 @@ async function processImage(gcsPath: string): Promise<number> {
   return created;
 }
 
+function isImageFile(name: string): boolean {
+  if (!name) return false;
+  if (name.endsWith("/")) return false;
+  if (VARIANT_REGEX.test(name)) return false;
+  const hasImageExt = /\.(jpg|jpeg|png|webp|bmp|tiff|tif|avif)$/i.test(name);
+  const hasNoExt = !name.includes(".");
+  return hasImageExt || hasNoExt;
+}
+
+function listDir(prefix: string): { dirs: string[]; files: string[] } {
+  const result = execFileSync(
+    "gcloud",
+    ["storage", "ls", `gs://${SOURCE_BUCKET}/${prefix}`, "--project", PROJECT],
+    { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 30_000 },
+  ).trim();
+
+  const dirs: string[] = [];
+  const files: string[] = [];
+
+  for (const line of result.split("\n").filter(Boolean)) {
+    const path = line.trim();
+    const name = path.replace(`gs://${SOURCE_BUCKET}/`, "");
+    if (name.endsWith("/")) {
+      dirs.push(name);
+    } else if (isImageFile(name)) {
+      files.push(path);
+    }
+  }
+
+  return { dirs, files };
+}
+
+async function processBatch(batch: string[]): Promise<{ created: number; errors: number }> {
+  let created = 0;
+  let errors = 0;
+
+  const results = await Promise.allSettled(
+    batch.map(async (gcsPath) => {
+      try {
+        return (await processImage(gcsPath)) > 0;
+      } catch (err) {
+        console.error(`  Error: ${gcsPath}`, err);
+        return false;
+      }
+    }),
+  );
+
+  for (const r of results) {
+    if (r.status === "fulfilled") {
+      if (r.value) created++;
+      else errors++;
+    } else {
+      errors++;
+    }
+  }
+
+  return { created, errors };
+}
+
+async function walkTree(prefix: string): Promise<void> {
+  const { dirs, files } = listDir(prefix);
+
+  // Process files in this directory in batches
+  for (let i = 0; i < files.length; i += CONCURRENCY) {
+    const batch = files.slice(i, i + CONCURRENCY);
+    const { created, errors } = await processBatch(batch);
+    processed += created;
+    totalErrors += errors;
+    totalFiles += batch.length;
+
+    console.log(
+      `  ${prefix}: +${batch.length} files (created: ${processed}, errors: ${totalErrors})`,
+    );
+  }
+
+  // Recurse into subdirectories
+  for (const dir of dirs) {
+    await walkTree(dir);
+  }
+}
+
+let processed = 0;
+let totalErrors = 0;
+let totalFiles = 0;
+
 async function main() {
   console.log(
     `Backfilling variants from ${SOURCE_BUCKET} → ${VARIANTS_BUCKET}`,
@@ -80,76 +165,18 @@ async function main() {
   console.log(`Concurrency: ${CONCURRENCY}`);
   console.log("");
 
-  const listResult = execFileSync(
-    "gcloud",
-    [
-      "storage",
-      "ls",
-      "--recursive",
-      `gs://${SOURCE_BUCKET}/images/`,
-      "--project",
-      PROJECT,
-    ],
-    { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 60_000 },
-  ).trim();
+  const startTime = Date.now();
+  await walkTree("images/");
 
-  const allFiles = listResult
-    .split("\n")
-    .filter(Boolean)
-    .filter((line) => {
-      const name = line.trim().replace(`gs://${SOURCE_BUCKET}/`, "");
-      if (!name) return false;
-      if (VARIANT_REGEX.test(name)) return false;
-      // Include image extensions OR files with no extension at all
-      // (warehouse doesn't append extensions)
-      const hasImageExt = /\.(jpg|jpeg|png|webp|bmp|tiff|tif|avif)$/i.test(name);
-      const hasNoExt = !name.includes(".");
-      if (!hasImageExt && !hasNoExt) return false;
-      return true;
-    });
-
-  console.log(`Total images to process: ${allFiles.length}`);
-  console.log("");
-
-  let processed = 0;
-  let errors = 0;
-  let batchNum = 0;
-
-  for (let i = 0; i < allFiles.length; i += CONCURRENCY) {
-    batchNum++;
-    const batch = allFiles.slice(i, i + CONCURRENCY);
-
-    const results = await Promise.allSettled(
-      batch.map(async (gcsPath) => {
-        try {
-          return (await processImage(gcsPath)) > 0 ? "created" : "empty";
-        } catch (err) {
-          console.error(`  Error: ${gcsPath}`, err);
-          return "error";
-        }
-      }),
-    );
-
-    for (const r of results) {
-      if (r.status === "fulfilled") {
-        if (r.value === "created") processed++;
-        else if (r.value === "error") errors++;
-      } else {
-        errors++;
-      }
-    }
-
-    const done = Math.min(i + CONCURRENCY, allFiles.length);
-    const pct = Math.round((done / allFiles.length) * 100);
-    console.log(
-      `Batch ${batchNum}: ${done}/${allFiles.length} (${pct}%) — created: ${processed}, errors: ${errors}`,
-    );
-  }
-
+  const totalTime = Math.round((Date.now() - startTime) / 1000);
+  const avgRate = totalTime > 0 ? Math.round(totalFiles / totalTime) : "?";
   console.log("");
   console.log("=== Backfill complete ===");
-  console.log(`  Variants created for: ${processed} images`);
-  console.log(`  Errors:                ${errors}`);
+  console.log(`  Total time:          ${totalTime}s`);
+  console.log(`  Average rate:        ${avgRate} files/s`);
+  console.log(`  Files processed:     ${totalFiles}`);
+  console.log(`  Variants created:    ${processed}`);
+  console.log(`  Errors:              ${totalErrors}`);
 }
 
 main().catch((err) => {
