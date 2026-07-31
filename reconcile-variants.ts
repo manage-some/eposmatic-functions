@@ -3,7 +3,8 @@ import sharp from "sharp";
 
 const SOURCE_BUCKET = "prod-managesome.appspot.com";
 const VARIANTS_BUCKET = "prod-managesome-variants";
-const CONCURRENCY = 12;
+// Higher concurrency than the original backfill (12) for a faster reconcile run
+const CONCURRENCY = 32;
 
 // Uses the VM's default service account (storage-rw scope) — no key file needed
 const storage = new Storage();
@@ -78,8 +79,11 @@ async function listAllNames(bucketName: string): Promise<string[]> {
   return names;
 }
 
-/** Generate a single missing source image's variants. */
-async function processSource(sourcePath: string): Promise<number> {
+/** Generate a source image's variants, skipping sizes that already exist. */
+async function processSource(
+  sourcePath: string,
+  variantNames: Set<string>,
+): Promise<number> {
   const [buffer] = await sourceBucket.file(sourcePath).download();
   if (!buffer || buffer.length === 0) {
     return 0;
@@ -90,8 +94,12 @@ async function processSource(sourcePath: string): Promise<number> {
 
   let created = 0;
   for (const size of SIZES) {
+    const variantPath = `${basePath}_${size.suffix}${ext}`;
+    // Skip sizes whose variant already exists — don't overwrite existing work
+    if (variantNames.has(variantPath)) {
+      continue;
+    }
     try {
-      const variantPath = `${basePath}_${size.suffix}${ext}`;
       const resizedBuffer = await sharp(buffer, {
         limitInputPixels: 100_000_000,
       })
@@ -159,7 +167,7 @@ async function main(): Promise<void> {
     const results = await Promise.allSettled(
       batch.map(async (sourcePath) => {
         try {
-          const count = await processSource(sourcePath);
+          const count = await processSource(sourcePath, variantNames);
           return count > 0 ? "created" : "skipped";
         } catch (err) {
           console.error(`  Error: ${sourcePath}`, err);
