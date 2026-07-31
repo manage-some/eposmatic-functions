@@ -31,10 +31,11 @@ async function processImage(filePath: string): Promise<number> {
     return 0;
   }
 
-  // Generate and upload all 4 variants in parallel
-  const results = await Promise.allSettled(
-    SIZES.map(async (size) => {
-      // Only append .webp if the original had an extension
+  // Generate and upload variants one at a time so each buffer is
+  // disposed before the next resize
+  let created = 0;
+  for (const size of SIZES) {
+    try {
       const variantExt = filePath.includes(".") ? ".webp" : "";
       const variantPath = `${basePath}_${size.suffix}${variantExt}`;
 
@@ -49,10 +50,13 @@ async function processImage(filePath: string): Promise<number> {
         .toBuffer();
 
       await variantsBucket.file(variantPath).save(resizedBuffer);
-    }),
-  );
+      created++;
+    } catch {
+      // variant failed — skip, continue with next size
+    }
+  }
 
-  return results.filter((r) => r.status === "fulfilled").length;
+  return created;
 }
 
 function isImageFile(name: string): boolean {
