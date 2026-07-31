@@ -33,6 +33,34 @@ const SIZES = [
  */
 const VARIANT_REGEX = /_\d+x\d+(\.webp)?$/i;
 
+/** Last path segment (the filename). */
+function lastSegment(name: string): string {
+  return name.slice(name.lastIndexOf("/") + 1);
+}
+
+/**
+ * Whether the FILENAME carries an extension (a dot not at index 0).
+ * Looks only at the last segment so dotted directory names (e.g.
+ * "thailemon.co.nz") never confuse the check.
+ */
+function hasExtension(name: string): boolean {
+  const dotIndex = lastSegment(name).lastIndexOf(".");
+  return dotIndex > 0;
+}
+
+/** Strip the extension from the LAST segment only, preserving dotted dirs. */
+function stripExtension(path: string): string {
+  const slashIndex = path.lastIndexOf("/");
+  const dir = slashIndex === -1 ? "" : path.slice(0, slashIndex + 1);
+  const filename = slashIndex === -1 ? path : path.slice(slashIndex + 1);
+  return dir + filename.replace(/\.[^.]+$/, "");
+}
+
+/** Variant extension: .webp only when the source filename had an extension. */
+function variantExt(sourcePath: string): string {
+  return hasExtension(sourcePath) ? ".webp" : "";
+}
+
 /** Size entry with typed fields. */
 interface SizeConfig {
   readonly suffix: string;
@@ -128,8 +156,8 @@ export const generateImageVariants = onObjectFinalized(
         return;
       }
 
-      // Strip extension to derive the base path
-      const basePath = filePath.replace(/\.[^.]+$/, "");
+      // Strip extension from the filename only (preserves dotted dirs)
+      const basePath = stripExtension(filePath);
 
       // Guard: source may have been deleted while we were processing
       // (race condition: upload → function starts → user deletes original)
@@ -144,9 +172,9 @@ export const generateImageVariants = onObjectFinalized(
       // Generate all variants in parallel (fit: "inside" preserves aspect ratio)
       const results = await Promise.allSettled(
         SIZES.map(async (size: SizeConfig) => {
-          // Only append .webp if the original had an extension
-          const variantExt = filePath.includes(".") ? ".webp" : "";
-          const variantPath = `${basePath}_${size.suffix}${variantExt}`;
+          // Only append .webp if the original filename had an extension
+          const ext = variantExt(filePath);
+          const variantPath = `${basePath}_${size.suffix}${ext}`;
 
           const resizedBuffer = await sharp(buffer, {
             limitInputPixels: 100_000_000,
@@ -252,7 +280,7 @@ export const cleanupVariants = onObjectDeleted(
 
     const variantsBucketName = getVariantsBucket(sourceBucket);
     const variantsBucketRef = storage.bucket(variantsBucketName);
-    const basePath = filePath.replace(/\.[^.]+$/, "");
+    const basePath = stripExtension(filePath);
 
     logger.info(
       `Cleaning up variants for deleted file: ${filePath} from ${variantsBucketName}`,
@@ -262,8 +290,8 @@ export const cleanupVariants = onObjectDeleted(
     const results = await Promise.allSettled(
       SIZES.map(async (size: SizeConfig) => {
         // Match the same naming logic as generateImageVariants
-        const variantExt = filePath.includes(".") ? ".webp" : "";
-        const variantPath = `${basePath}_${size.suffix}${variantExt}`;
+        const ext = variantExt(filePath);
+        const variantPath = `${basePath}_${size.suffix}${ext}`;
         await variantsBucketRef.file(variantPath).delete();
         return variantPath;
       }),

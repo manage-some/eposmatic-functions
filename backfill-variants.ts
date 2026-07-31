@@ -19,11 +19,39 @@ const SIZES = [
 
 const VARIANT_REGEX = /_\d+x\d+(\.webp)?$/i;
 
+/** Last path segment (the filename). */
+function lastSegment(name: string): string {
+  return name.slice(name.lastIndexOf("/") + 1);
+}
+
+/**
+ * Whether the FILENAME carries an extension (a dot not at index 0).
+ * Looks only at the last segment so dotted directory names (e.g.
+ * "thailemon.co.nz") never confuse the check.
+ */
+function hasExtension(name: string): boolean {
+  const dotIndex = lastSegment(name).lastIndexOf(".");
+  return dotIndex > 0;
+}
+
+/** Strip the extension from the LAST segment only, preserving dotted dirs. */
+function stripExtension(path: string): string {
+  const slashIndex = path.lastIndexOf("/");
+  const dir = slashIndex === -1 ? "" : path.slice(0, slashIndex + 1);
+  const filename = slashIndex === -1 ? path : path.slice(slashIndex + 1);
+  return dir + filename.replace(/\.[^.]+$/, "");
+}
+
+/** Variant extension: .webp only when the source filename had an extension. */
+function variantExt(sourcePath: string): string {
+  return hasExtension(sourcePath) ? ".webp" : "";
+}
+
 async function processImage(filePath: string): Promise<number> {
   // Guard: skip anything that looks like a directory or listing entry
   if (filePath.endsWith("/") || filePath.endsWith(":")) return 0;
 
-  const basePath = filePath.replace(/\.[^.]+$/, "");
+  const basePath = stripExtension(filePath);
 
   // Download original to memory via SDK (no temp files, no root-owned dir issues)
   const [buffer] = await sourceBucket.file(filePath).download();
@@ -36,8 +64,8 @@ async function processImage(filePath: string): Promise<number> {
   let created = 0;
   for (const size of SIZES) {
     try {
-      const variantExt = filePath.includes(".") ? ".webp" : "";
-      const variantPath = `${basePath}_${size.suffix}${variantExt}`;
+      const ext = variantExt(filePath);
+      const variantPath = `${basePath}_${size.suffix}${ext}`;
 
       const resizedBuffer = await sharp(buffer, {
         limitInputPixels: 100_000_000,
@@ -68,8 +96,9 @@ function isImageFile(name: string): boolean {
   if (!name) return false;
   if (name.endsWith("/")) return false;
   if (VARIANT_REGEX.test(name)) return false;
-  const hasImageExt = /\.(jpg|jpeg|png|webp|bmp|tiff|tif|avif)$/i.test(name);
-  const hasNoExt = !name.includes(".");
+  const filename = lastSegment(name);
+  const hasImageExt = /\.(jpg|jpeg|png|webp|bmp|tiff|tif|avif)$/i.test(filename);
+  const hasNoExt = !filename.includes(".");
   return hasImageExt || hasNoExt;
 }
 
