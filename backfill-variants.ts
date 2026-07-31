@@ -1,13 +1,16 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import sharp from "sharp";
 
-const PROJECT = "dev-managesome";
-const SOURCE_BUCKET = "dev-managesome.appspot.com";
-const VARIANTS_BUCKET = "dev-managesome-variants";
-const CONCURRENCY = 30;
+const execFileAsync = promisify(execFile);
+
+const PROJECT = "prod-managesome";
+const SOURCE_BUCKET = "prod-managesome.appspot.com";
+const VARIANTS_BUCKET = "prod-managesome-variants";
+const CONCURRENCY = 50;
 const TMP = join(tmpdir(), "backfill-variants");
 mkdirSync(TMP, { recursive: true });
 
@@ -20,14 +23,16 @@ const SIZES = [
 
 const VARIANT_REGEX = /_\d+x\d+(\.webp)?$/i;
 
-function gcloudStorage(args: string[]): void {
-  execFileSync("gcloud", ["storage", ...args, "--project", PROJECT], {
-    stdio: "ignore",
-    timeout: 30_000,
+async function gcloudStorageAsync(args: string[]): Promise<void> {
+  await execFileAsync("gcloud", ["storage", ...args, "--project", PROJECT], {
+    timeout: 120_000,
   });
 }
 
 async function processImage(gcsPath: string): Promise<number> {
+  // Guard: skip anything that looks like a directory or listing entry
+  if (gcsPath.endsWith("/") || gcsPath.endsWith(":")) return 0;
+
   const filePath = gcsPath.replace(`gs://${SOURCE_BUCKET}/`, "");
   const basePath = filePath.replace(/\.[^.]+$/, "");
 
@@ -37,7 +42,7 @@ async function processImage(gcsPath: string): Promise<number> {
   const localFile = join(imgDir, "original");
 
   // 1 gcloud call — download
-  gcloudStorage(["cp", gcsPath, localFile]);
+  await gcloudStorageAsync(["cp", gcsPath, localFile]);
 
   const buffer = readFileSync(localFile);
   if (!buffer || buffer.length === 0) {
@@ -64,7 +69,11 @@ async function processImage(gcsPath: string): Promise<number> {
         .toBuffer();
 
       writeFileSync(tmpFile, resizedBuffer);
-      gcloudStorage(["cp", tmpFile, `gs://${VARIANTS_BUCKET}/${variantPath}`]);
+      await gcloudStorageAsync([
+        "cp",
+        tmpFile,
+        `gs://${VARIANTS_BUCKET}/${variantPath}`,
+      ]);
     }),
   );
 
@@ -86,7 +95,7 @@ function listDir(prefix: string): { dirs: string[]; files: string[] } {
   const result = execFileSync(
     "gcloud",
     ["storage", "ls", `gs://${SOURCE_BUCKET}/${prefix}`, "--project", PROJECT],
-    { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 30_000 },
+    { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 120_000 },
   ).trim();
 
   const dirs: string[] = [];
@@ -94,7 +103,14 @@ function listDir(prefix: string): { dirs: string[]; files: string[] } {
 
   for (const line of result.split("\n").filter(Boolean)) {
     const path = line.trim();
-    const name = path.replace(`gs://${SOURCE_BUCKET}/`, "");
+    const name = path
+      .replace(`gs://${SOURCE_BUCKET}/`, "")
+      .replace(/:$/, "");
+    if (!name) continue;
+    // Skip the current directory itself (gcloud may return it in listing)
+    if (name.replace(/\/$/, "") === prefix.replace(/\/$/, "")) {
+      continue;
+    }
     if (name.endsWith("/")) {
       dirs.push(name);
     } else if (isImageFile(name)) {
@@ -105,31 +121,37 @@ function listDir(prefix: string): { dirs: string[]; files: string[] } {
   return { dirs, files };
 }
 
-async function processBatch(batch: string[]): Promise<{ created: number; errors: number }> {
+async function processBatch(
+  batch: string[],
+): Promise<{ created: number; skipped: number; errors: number }> {
   let created = 0;
+  let skipped = 0;
   let errors = 0;
 
   const results = await Promise.allSettled(
     batch.map(async (gcsPath) => {
       try {
-        return (await processImage(gcsPath)) > 0;
+        const count = await processImage(gcsPath);
+        if (count > 0) return "created";
+        return "skipped";
       } catch (err) {
         console.error(`  Error: ${gcsPath}`, err);
-        return false;
+        return "error";
       }
     }),
   );
 
   for (const r of results) {
     if (r.status === "fulfilled") {
-      if (r.value) created++;
-      else errors++;
+      if (r.value === "created") created++;
+      else if (r.value === "error") errors++;
+      else skipped++;
     } else {
       errors++;
     }
   }
 
-  return { created, errors };
+  return { created, skipped, errors };
 }
 
 async function walkTree(prefix: string): Promise<void> {
@@ -138,8 +160,9 @@ async function walkTree(prefix: string): Promise<void> {
   // Process files in this directory in batches
   for (let i = 0; i < files.length; i += CONCURRENCY) {
     const batch = files.slice(i, i + CONCURRENCY);
-    const { created, errors } = await processBatch(batch);
+    const { created, skipped, errors } = await processBatch(batch);
     processed += created;
+    totalSkipped += skipped;
     totalErrors += errors;
     totalFiles += batch.length;
 
@@ -155,6 +178,7 @@ async function walkTree(prefix: string): Promise<void> {
 }
 
 let processed = 0;
+let totalSkipped = 0;
 let totalErrors = 0;
 let totalFiles = 0;
 
@@ -176,6 +200,7 @@ async function main() {
   console.log(`  Average rate:        ${avgRate} files/s`);
   console.log(`  Files processed:     ${totalFiles}`);
   console.log(`  Variants created:    ${processed}`);
+  console.log(`  Skipped (empty):     ${totalSkipped}`);
   console.log(`  Errors:              ${totalErrors}`);
 }
 
