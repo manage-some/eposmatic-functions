@@ -53,7 +53,10 @@ function stripExtension(path: string): string {
   const slashIndex = path.lastIndexOf("/");
   const dir = slashIndex === -1 ? "" : path.slice(0, slashIndex + 1);
   const filename = slashIndex === -1 ? path : path.slice(slashIndex + 1);
-  return dir + filename.replace(/\.[^.]+$/, "");
+  // A dot at index 0 (e.g. a bare ".webp" name) is not a real extension — keep it
+  const dotIndex = filename.lastIndexOf(".");
+  if (dotIndex <= 0) return path;
+  return dir + filename.slice(0, dotIndex);
 }
 
 /** Variant extension: .webp only when the source filename had an extension. */
