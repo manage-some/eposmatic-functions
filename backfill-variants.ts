@@ -10,7 +10,7 @@ const execFileAsync = promisify(execFile);
 const PROJECT = "prod-managesome";
 const SOURCE_BUCKET = "prod-managesome.appspot.com";
 const VARIANTS_BUCKET = "prod-managesome-variants";
-const CONCURRENCY = 50;
+const CONCURRENCY = 150;
 const TMP = join(tmpdir(), "backfill-variants");
 mkdirSync(TMP, { recursive: true });
 
