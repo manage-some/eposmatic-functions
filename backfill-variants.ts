@@ -49,7 +49,9 @@ async function processImage(filePath: string): Promise<number> {
         .webp({ quality: 80 })
         .toBuffer();
 
-      await variantsBucket.file(variantPath).save(resizedBuffer);
+      await variantsBucket.file(variantPath).save(resizedBuffer, {
+        contentType: "image/webp",
+      });
       created++;
     } catch {
       // variant failed — skip, continue with next size
