@@ -1,4 +1,4 @@
-import { GetFilesOptions, Storage } from "@google-cloud/storage";
+import { File, GetFilesOptions, Storage } from "@google-cloud/storage";
 import sharp from "sharp";
 
 const PROJECT = "prod-managesome";
@@ -74,7 +74,14 @@ async function listDir(
   // delimiter "/" returns a one-level-deep listing: subdirectory prefixes + immediate files
   let query: GetFilesOptions | undefined = { prefix, delimiter: "/" };
   while (query) {
-    const [page, nextQuery, apiResponse] = await sourceBucket.getFiles(query);
+    const result: {
+      0: File[];
+      1: GetFilesOptions | null;
+      2: { prefixes?: string[] };
+    } = (await sourceBucket.getFiles(query)) as never;
+    const page = result[0];
+    const nextQuery = result[1];
+    const apiResponse = result[2];
     for (const p of apiResponse.prefixes ?? []) {
       // Skip the current directory itself if the API echoes it back
       if (p !== prefix) dirs.add(p);
