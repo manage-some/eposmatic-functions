@@ -77,7 +77,7 @@ async function processImage(filePath: string): Promise<number> {
           fit: "inside",
           withoutEnlargement: true,
         })
-        .webp({ quality: 100, effort: 6 })
+        .webp({ quality: 100, effort: 4 })
         .toBuffer();
 
       await variantsBucket.file(variantPath).save(resizedBuffer, {
