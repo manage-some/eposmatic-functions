@@ -1,4 +1,4 @@
-import { File, GetFilesOptions, GetFilesResponse, Storage } from "@google-cloud/storage";
+import { Storage } from "@google-cloud/storage";
 import sharp from "sharp";
 
 const PROJECT = "prod-managesome";
@@ -65,35 +65,10 @@ function isImageFile(name: string): boolean {
   return hasImageExt || hasNoExt;
 }
 
-/** Extract subdirectory prefixes from the GCS listing response. */
-function getDirectoryPrefixes(apiResponse: unknown): string[] {
-  if (typeof apiResponse !== "object" || apiResponse === null) return [];
-  const prefixes = (apiResponse as { prefixes?: unknown }).prefixes;
-  return Array.isArray(prefixes) ? (prefixes as string[]) : [];
-}
-
-async function listDir(
-  prefix: string,
-): Promise<{ dirs: string[]; files: string[] }> {
-  const dirs = new Set<string>();
-  const files: string[] = [];
-
-  // delimiter "/" returns a one-level-deep listing: subdirectory prefixes + immediate files
-  let query: GetFilesOptions | undefined = { prefix, delimiter: "/" };
-  while (query) {
-    const [page, nextQuery, apiResponse]: GetFilesResponse =
-      await sourceBucket.getFiles(query);
-    for (const p of getDirectoryPrefixes(apiResponse)) {
-      // Skip the current directory itself if the API echoes it back
-      if (p !== prefix) dirs.add(p);
-    }
-    for (const f of page) {
-      if (isImageFile(f.name)) files.push(f.name);
-    }
-    query = nextQuery ?? undefined;
-  }
-
-  return { dirs: [...dirs], files };
+async function listAllImages(): Promise<string[]> {
+  // auto-paginated listing of every object under images/
+  const [allFiles] = await sourceBucket.getFiles({ prefix: "images/" });
+  return allFiles.map((file) => file.name).filter(isImageFile);
 }
 
 async function processBatch(
@@ -129,29 +104,6 @@ async function processBatch(
   return { created, skipped, errors };
 }
 
-async function walkTree(prefix: string): Promise<void> {
-  const { dirs, files } = await listDir(prefix);
-
-  // Process files in this directory in batches
-  for (let i = 0; i < files.length; i += CONCURRENCY) {
-    const batch = files.slice(i, i + CONCURRENCY);
-    const { created, skipped, errors } = await processBatch(batch);
-    processed += created;
-    totalSkipped += skipped;
-    totalErrors += errors;
-    totalFiles += batch.length;
-
-    console.log(
-      `  ${prefix}: +${batch.length} files (created: ${processed}, errors: ${totalErrors})`,
-    );
-  }
-
-  // Recurse into subdirectories
-  for (const dir of dirs) {
-    await walkTree(dir);
-  }
-}
-
 let processed = 0;
 let totalSkipped = 0;
 let totalErrors = 0;
@@ -165,7 +117,22 @@ async function main() {
   console.log("");
 
   const startTime = Date.now();
-  await walkTree("images/");
+
+  const imagePaths = await listAllImages();
+
+  // Process in batches
+  for (let i = 0; i < imagePaths.length; i += CONCURRENCY) {
+    const batch = imagePaths.slice(i, i + CONCURRENCY);
+    const { created, skipped, errors } = await processBatch(batch);
+    processed += created;
+    totalSkipped += skipped;
+    totalErrors += errors;
+    totalFiles += batch.length;
+
+    console.log(
+      `  +${batch.length} files (created: ${processed}, errors: ${totalErrors})`,
+    );
+  }
 
   const totalTime = Math.round((Date.now() - startTime) / 1000);
   const avgRate = totalTime > 0 ? Math.round(totalFiles / totalTime) : "?";
