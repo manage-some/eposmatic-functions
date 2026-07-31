@@ -1,7 +1,6 @@
 import { Storage } from "@google-cloud/storage";
 import sharp from "sharp";
 
-const PROJECT = "prod-managesome";
 const SOURCE_BUCKET = "prod-managesome.appspot.com";
 const VARIANTS_BUCKET = "prod-managesome-variants";
 const CONCURRENCY = 12;
@@ -118,7 +117,9 @@ async function main() {
 
   const startTime = Date.now();
 
+  console.log("Listing images from source bucket...");
   const imagePaths = await listAllImages();
+  console.log(`  Found ${imagePaths.length} images to process`);
 
   // Process in batches
   for (let i = 0; i < imagePaths.length; i += CONCURRENCY) {
