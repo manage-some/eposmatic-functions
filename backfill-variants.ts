@@ -77,7 +77,7 @@ async function processImage(filePath: string): Promise<number> {
           fit: "inside",
           withoutEnlargement: true,
         })
-        .webp({ quality: 80 })
+        .webp({ quality: 100, effort: 6 })
         .toBuffer();
 
       await variantsBucket.file(variantPath).save(resizedBuffer, {
@@ -100,14 +100,16 @@ function isImageFile(name: string): boolean {
   if (name.endsWith("/")) return false;
   if (VARIANT_REGEX.test(name)) return false;
   const filename = lastSegment(name);
-  const hasImageExt = /\.(jpg|jpeg|png|webp|bmp|tiff|tif|avif)$/i.test(filename);
+  const hasImageExt = /\.(jpg|jpeg|png|webp|bmp|tiff|tif|avif)$/i.test(
+    filename,
+  );
   const hasNoExt = !filename.includes(".");
   return hasImageExt || hasNoExt;
 }
 
 async function listAllImages(): Promise<string[]> {
-  // auto-paginated listing of every object under images/
-  const [allFiles] = await sourceBucket.getFiles({ prefix: "images/" });
+  // auto-paginated listing of the ENTIRE bucket (images/, platforms/, rider-app/, ...)
+  const [allFiles] = await sourceBucket.getFiles();
   return allFiles.map((file) => file.name).filter(isImageFile);
 }
 
@@ -158,7 +160,7 @@ async function main() {
 
   const startTime = Date.now();
 
-  console.log("Listing images from source bucket...");
+  console.log("Listing images from entire source bucket...");
   const imagePaths = await listAllImages();
   console.log(`  Found ${imagePaths.length} images to process`);
 

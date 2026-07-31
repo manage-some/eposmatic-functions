@@ -186,7 +186,7 @@ export const generateImageVariants = onObjectFinalized(
               fit: "inside",
               withoutEnlargement: true,
             })
-            .webp({ quality: 80 })
+            .webp({ quality: 100, effort: 6 })
             .toBuffer();
 
           await variantsBucketRef.file(variantPath).save(resizedBuffer, {
