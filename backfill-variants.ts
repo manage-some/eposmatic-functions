@@ -1,18 +1,15 @@
-import { execFile, execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { promisify } from "node:util";
+import { GetFilesOptions, Storage } from "@google-cloud/storage";
 import sharp from "sharp";
-
-const execFileAsync = promisify(execFile);
 
 const PROJECT = "prod-managesome";
 const SOURCE_BUCKET = "prod-managesome.appspot.com";
 const VARIANTS_BUCKET = "prod-managesome-variants";
-const CONCURRENCY = 8;
-const TMP = join(tmpdir(), "backfill-variants");
-mkdirSync(TMP, { recursive: true });
+const CONCURRENCY = 12;
+
+// Uses the VM's default service account (storage-rw scope) — no key file needed
+const storage = new Storage();
+const sourceBucket = storage.bucket(SOURCE_BUCKET);
+const variantsBucket = storage.bucket(VARIANTS_BUCKET);
 
 const SIZES = [
   { suffix: "64x64", width: 64, height: 64 },
@@ -23,30 +20,15 @@ const SIZES = [
 
 const VARIANT_REGEX = /_\d+x\d+(\.webp)?$/i;
 
-async function gcloudStorageAsync(args: string[]): Promise<void> {
-  await execFileAsync("gcloud", ["storage", ...args, "--project", PROJECT], {
-    timeout: 120_000,
-  });
-}
-
-async function processImage(gcsPath: string): Promise<number> {
+async function processImage(filePath: string): Promise<number> {
   // Guard: skip anything that looks like a directory or listing entry
-  if (gcsPath.endsWith("/") || gcsPath.endsWith(":")) return 0;
+  if (filePath.endsWith("/") || filePath.endsWith(":")) return 0;
 
-  const filePath = gcsPath.replace(`gs://${SOURCE_BUCKET}/`, "");
   const basePath = filePath.replace(/\.[^.]+$/, "");
 
-  // Single temp dir per image
-  const imgDir = join(TMP, Buffer.from(gcsPath).toString("base64"));
-  mkdirSync(imgDir, { recursive: true });
-  const localFile = join(imgDir, "original");
-
-  // 1 gcloud call — download
-  await gcloudStorageAsync(["cp", gcsPath, localFile]);
-
-  const buffer = readFileSync(localFile);
+  // Download original to memory via SDK (no temp files, no root-owned dir issues)
+  const [buffer] = await sourceBucket.file(filePath).download();
   if (!buffer || buffer.length === 0) {
-    rmSync(imgDir, { recursive: true, force: true });
     return 0;
   }
 
@@ -56,7 +38,6 @@ async function processImage(gcsPath: string): Promise<number> {
       // Only append .webp if the original had an extension
       const variantExt = filePath.includes(".") ? ".webp" : "";
       const variantPath = `${basePath}_${size.suffix}${variantExt}`;
-      const tmpFile = join(imgDir, size.suffix);
 
       const resizedBuffer = await sharp(buffer, {
         limitInputPixels: 100_000_000,
@@ -68,18 +49,11 @@ async function processImage(gcsPath: string): Promise<number> {
         .webp({ quality: 80 })
         .toBuffer();
 
-      writeFileSync(tmpFile, resizedBuffer);
-      await gcloudStorageAsync([
-        "cp",
-        tmpFile,
-        `gs://${VARIANTS_BUCKET}/${variantPath}`,
-      ]);
+      await variantsBucket.file(variantPath).save(resizedBuffer);
     }),
   );
 
-  const created = results.filter((r) => r.status === "fulfilled").length;
-  rmSync(imgDir, { recursive: true, force: true });
-  return created;
+  return results.filter((r) => r.status === "fulfilled").length;
 }
 
 function isImageFile(name: string): boolean {
@@ -91,34 +65,27 @@ function isImageFile(name: string): boolean {
   return hasImageExt || hasNoExt;
 }
 
-function listDir(prefix: string): { dirs: string[]; files: string[] } {
-  const result = execFileSync(
-    "gcloud",
-    ["storage", "ls", `gs://${SOURCE_BUCKET}/${prefix}`, "--project", PROJECT],
-    { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 120_000 },
-  ).trim();
-
-  const dirs: string[] = [];
+async function listDir(
+  prefix: string,
+): Promise<{ dirs: string[]; files: string[] }> {
+  const dirs = new Set<string>();
   const files: string[] = [];
 
-  for (const line of result.split("\n").filter(Boolean)) {
-    const path = line.trim();
-    const name = path
-      .replace(`gs://${SOURCE_BUCKET}/`, "")
-      .replace(/:$/, "");
-    if (!name) continue;
-    // Skip the current directory itself (gcloud may return it in listing)
-    if (name.replace(/\/$/, "") === prefix.replace(/\/$/, "")) {
-      continue;
+  // delimiter "/" returns a one-level-deep listing: subdirectory prefixes + immediate files
+  let query: GetFilesOptions | undefined = { prefix, delimiter: "/" };
+  while (query) {
+    const [page, nextQuery, apiResponse] = await sourceBucket.getFiles(query);
+    for (const p of apiResponse.prefixes ?? []) {
+      // Skip the current directory itself if the API echoes it back
+      if (p !== prefix) dirs.add(p);
     }
-    if (name.endsWith("/")) {
-      dirs.push(name);
-    } else if (isImageFile(name)) {
-      files.push(path);
+    for (const f of page) {
+      if (isImageFile(f.name)) files.push(f.name);
     }
+    query = nextQuery ?? undefined;
   }
 
-  return { dirs, files };
+  return { dirs: [...dirs], files };
 }
 
 async function processBatch(
@@ -155,7 +122,7 @@ async function processBatch(
 }
 
 async function walkTree(prefix: string): Promise<void> {
-  const { dirs, files } = listDir(prefix);
+  const { dirs, files } = await listDir(prefix);
 
   // Process files in this directory in batches
   for (let i = 0; i < files.length; i += CONCURRENCY) {
