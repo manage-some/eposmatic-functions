@@ -50,7 +50,10 @@ async function processImage(filePath: string): Promise<number> {
         .toBuffer();
 
       await variantsBucket.file(variantPath).save(resizedBuffer, {
-        contentType: "image/webp",
+        metadata: {
+          contentType: "image/webp",
+          cacheControl: "public, max-age=31536000",
+        },
       });
       created++;
     } catch {
