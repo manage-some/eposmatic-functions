@@ -1,6 +1,6 @@
 import { Storage } from "@google-cloud/storage";
-import sharp from "sharp";
 import PQueue from "p-queue";
+import sharp from "sharp";
 import {
   LARGE_VARIANT_WIDTH,
   SIZES,
@@ -16,7 +16,7 @@ import {
 
 const SOURCE_BUCKET = "prod-managesome.appspot.com";
 const VARIANTS_BUCKET = "prod-managesome-variants";
-const CONCURRENCY = 48;
+const CONCURRENCY = 12;
 
 // Uses the VM's default service account (storage-rw scope) — no key file needed
 const storage = new Storage();
