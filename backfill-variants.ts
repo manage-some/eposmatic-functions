@@ -1,5 +1,15 @@
 import { Storage } from "@google-cloud/storage";
 import sharp from "sharp";
+import {
+  SIZES,
+  VARIANT_REGEX,
+  lastSegment,
+  stripExtension,
+  variantExt,
+  LARGE_VARIANT_WIDTH,
+  webpEncodeOptions,
+  encodeVariant,
+} from "./src/variants.js";
 
 const SOURCE_BUCKET = "prod-managesome.appspot.com";
 const VARIANTS_BUCKET = "prod-managesome-variants";
@@ -9,46 +19,6 @@ const CONCURRENCY = 12;
 const storage = new Storage();
 const sourceBucket = storage.bucket(SOURCE_BUCKET);
 const variantsBucket = storage.bucket(VARIANTS_BUCKET);
-
-const SIZES = [
-  { suffix: "64x64", width: 64, height: 64 },
-  { suffix: "128x128", width: 128, height: 128 },
-  { suffix: "256x256", width: 256, height: 256 },
-  { suffix: "512x512", width: 512, height: 512 },
-] as const;
-
-const VARIANT_REGEX = /_\d+x\d+(\.webp)?$/i;
-
-/** Last path segment (the filename). */
-function lastSegment(name: string): string {
-  return name.slice(name.lastIndexOf("/") + 1);
-}
-
-/**
- * Whether the FILENAME carries an extension (a dot not at index 0).
- * Looks only at the last segment so dotted directory names (e.g.
- * "thailemon.co.nz") never confuse the check.
- */
-function hasExtension(name: string): boolean {
-  const dotIndex = lastSegment(name).lastIndexOf(".");
-  return dotIndex > 0;
-}
-
-/** Strip the extension from the LAST segment only, preserving dotted dirs. */
-function stripExtension(path: string): string {
-  const slashIndex = path.lastIndexOf("/");
-  const dir = slashIndex === -1 ? "" : path.slice(0, slashIndex + 1);
-  const filename = slashIndex === -1 ? path : path.slice(slashIndex + 1);
-  // A dot at index 0 (e.g. a bare ".webp" name) is not a real extension — keep it
-  const dotIndex = filename.lastIndexOf(".");
-  if (dotIndex <= 0) return path;
-  return dir + filename.slice(0, dotIndex);
-}
-
-/** Variant extension: .webp only when the source filename had an extension. */
-function variantExt(sourcePath: string): string {
-  return hasExtension(sourcePath) ? ".webp" : "";
-}
 
 async function processImage(filePath: string): Promise<number> {
   // Guard: skip anything that looks like a directory or listing entry
@@ -62,23 +32,30 @@ async function processImage(filePath: string): Promise<number> {
     return 0;
   }
 
+  // Read the actual source format (header-only, cheap) and pick encoder
+  // settings that preserve quality for already-compressed inputs.
+  const { format } = await sharp(buffer, {
+    limitInputPixels: 100_000_000,
+  }).metadata();
+
   // Generate and upload variants one at a time so each buffer is
   // disposed before the next resize
   let created = 0;
+  const succeededPaths: string[] = [];
+  let failedCount = 0;
   for (const size of SIZES) {
     try {
       const ext = variantExt(filePath);
       const variantPath = `${basePath}_${size.suffix}${ext}`;
 
-      const resizedBuffer = await sharp(buffer, {
-        limitInputPixels: 100_000_000,
-      })
-        .resize(size.width, size.height, {
-          fit: "inside",
-          withoutEnlargement: true,
-        })
-        .webp({ quality: 100, effort: 4 })
-        .toBuffer();
+      // Preserve source quality; only the largest variant gets a lossy
+      // q85 fallback (keeps whichever is smaller) as a safety net.
+      const { buffer: resizedBuffer } = await encodeVariant(
+        buffer,
+        size,
+        webpEncodeOptions(format),
+        size.width >= LARGE_VARIANT_WIDTH,
+      );
 
       await variantsBucket.file(variantPath).save(resizedBuffer, {
         metadata: {
@@ -86,10 +63,30 @@ async function processImage(filePath: string): Promise<number> {
           cacheControl: "public, max-age=31536000",
         },
       });
+      succeededPaths.push(variantPath);
       created++;
-    } catch {
-      // variant failed — skip, continue with next size
+    } catch (err) {
+      failedCount++;
+      console.error(`  Variant failed for ${filePath} (${size.suffix}):`, err);
     }
+  }
+
+  // Roll back partial sets so consumers never see a partial group — they
+  // fall back to the original via getImageUrl().
+  if (failedCount > 0 && succeededPaths.length > 0) {
+    console.warn(
+      `  Rolling back ${succeededPaths.length} variant(s) for ${filePath} after ${failedCount} failure(s)`,
+    );
+    await Promise.allSettled(
+      succeededPaths.map(async (path) => {
+        try {
+          await variantsBucket.file(path).delete();
+        } catch {
+          // 404 or other delete error — non-critical at this point
+        }
+      }),
+    );
+    created = 0;
   }
 
   return created;

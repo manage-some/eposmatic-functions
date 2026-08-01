@@ -10,66 +10,22 @@ import {
   onObjectFinalized,
 } from "firebase-functions/v2/storage";
 import sharp from "sharp";
+import {
+  describeEncodeMode,
+  encodeVariant,
+  LARGE_VARIANT_WIDTH,
+  SIZES,
+  stripExtension,
+  VARIANT_REGEX,
+  variantExt,
+  webpEncodeOptions,
+  type SizeConfig,
+} from "./variants.js";
 
 initializeApp();
 
 /** The default Firebase Storage bucket to watch. */
 const SOURCE_BUCKET = process.env.SOURCE_BUCKET;
-
-/**
- * Variant sizes to generate.
- * Each entry defines the output dimensions and filename suffix.
- */
-const SIZES = [
-  { suffix: "64x64", width: 64, height: 64 },
-  { suffix: "128x128", width: 128, height: 128 },
-  { suffix: "256x256", width: 256, height: 256 },
-  { suffix: "512x512", width: 512, height: 512 },
-] as const;
-
-/**
- * Regex to detect files that are already variants.
- * Matches filenames ending in _{digits}x{digits}.webp
- */
-const VARIANT_REGEX = /_\d+x\d+(\.webp)?$/i;
-
-/** Last path segment (the filename). */
-function lastSegment(name: string): string {
-  return name.slice(name.lastIndexOf("/") + 1);
-}
-
-/**
- * Whether the FILENAME carries an extension (a dot not at index 0).
- * Looks only at the last segment so dotted directory names (e.g.
- * "thailemon.co.nz") never confuse the check.
- */
-function hasExtension(name: string): boolean {
-  const dotIndex = lastSegment(name).lastIndexOf(".");
-  return dotIndex > 0;
-}
-
-/** Strip the extension from the LAST segment only, preserving dotted dirs. */
-function stripExtension(path: string): string {
-  const slashIndex = path.lastIndexOf("/");
-  const dir = slashIndex === -1 ? "" : path.slice(0, slashIndex + 1);
-  const filename = slashIndex === -1 ? path : path.slice(slashIndex + 1);
-  // A dot at index 0 (e.g. a bare ".webp" name) is not a real extension — keep it
-  const dotIndex = filename.lastIndexOf(".");
-  if (dotIndex <= 0) return path;
-  return dir + filename.slice(0, dotIndex);
-}
-
-/** Variant extension: .webp only when the source filename had an extension. */
-function variantExt(sourcePath: string): string {
-  return hasExtension(sourcePath) ? ".webp" : "";
-}
-
-/** Size entry with typed fields. */
-interface SizeConfig {
-  readonly suffix: string;
-  readonly width: number;
-  readonly height: number;
-}
 
 /**
  * Content types that should be skipped because sharp
@@ -141,6 +97,17 @@ export const generateImageVariants = onObjectFinalized(
 
     const sourceBucket = object.bucket;
     const variantsBucketName = getVariantsBucket(sourceBucket);
+
+    // Guard: never write variants into the source bucket. If the derived
+    // variants bucket resolves to the same bucket (e.g. non-.appspot.com
+    // source and no VARIANTS_BUCKET override), refuse instead of polluting it.
+    if (variantsBucketName === sourceBucket) {
+      logger.error(
+        `Refusing to generate variants for ${filePath}: variants bucket ${variantsBucketName} is the same as the source bucket. Set VARIANTS_BUCKET or use a *.appspot.com bucket.`,
+      );
+      return;
+    }
+
     const storage = getStorage();
     const sourceBucketRef = storage.bucket(sourceBucket);
     const variantsBucketRef = storage.bucket(variantsBucketName);
@@ -158,6 +125,14 @@ export const generateImageVariants = onObjectFinalized(
         logger.warn(`Empty file, skipping variants for ${filePath}`);
         return;
       }
+
+      // Read the actual source format (header-only, cheap) so we can pick
+      // quality-preserving encoder settings for already-compressed inputs.
+      const { format } = await sharp(buffer, {
+        limitInputPixels: 100_000_000,
+      }).metadata();
+
+      logger.info(`Encoding ${filePath} as ${format ?? "unknown"}`);
 
       // Strip extension from the filename only (preserves dotted dirs)
       const basePath = stripExtension(filePath);
@@ -179,15 +154,15 @@ export const generateImageVariants = onObjectFinalized(
           const ext = variantExt(filePath);
           const variantPath = `${basePath}_${size.suffix}${ext}`;
 
-          const resizedBuffer = await sharp(buffer, {
-            limitInputPixels: 100_000_000,
-          })
-            .resize(size.width, size.height, {
-              fit: "inside",
-              withoutEnlargement: true,
-            })
-            .webp({ quality: 100, effort: 6 })
-            .toBuffer();
+          // Preserve source quality; only the largest variant gets a lossy
+          // q85 fallback (keeps whichever is smaller) as a safety net.
+          const { buffer: resizedBuffer, options: usedOptions } =
+            await encodeVariant(
+              buffer,
+              size,
+              webpEncodeOptions(format),
+              size.width >= LARGE_VARIANT_WIDTH,
+            );
 
           await variantsBucketRef.file(variantPath).save(resizedBuffer, {
             metadata: {
@@ -195,6 +170,10 @@ export const generateImageVariants = onObjectFinalized(
               cacheControl: object.cacheControl || "public, max-age=31536000",
             },
           });
+
+          logger.info(
+            `Created variant: ${variantPath} (${describeEncodeMode(usedOptions)})`,
+          );
 
           return variantPath;
         }),
@@ -207,7 +186,6 @@ export const generateImageVariants = onObjectFinalized(
       for (const result of results) {
         if (result.status === "fulfilled") {
           succeeded.push(result.value);
-          logger.info(`Created variant: ${result.value}`);
         } else {
           failed.push(result.reason);
           logger.error(`Failed to create variant`, result.reason);
@@ -232,7 +210,11 @@ export const generateImageVariants = onObjectFinalized(
         );
       }
     } catch (err) {
+      // Log AND rethrow so the invocation is marked failed (visible in the
+      // Functions dashboard / error monitoring). Consumers fall back to the
+      // original until a retry or backfill regenerates the variants.
       logger.error(`Failed to generate variants for ${filePath}`, err);
+      throw err;
     }
   },
 );
@@ -282,6 +264,17 @@ export const cleanupVariants = onObjectDeleted(
     }
 
     const variantsBucketName = getVariantsBucket(sourceBucket);
+
+    // Guard: never touch the source bucket during cleanup. If the derived
+    // variants bucket is the same as the source (no VARIANTS_BUCKET override
+    // on a non-.appspot.com bucket), skip rather than delete originals.
+    if (variantsBucketName === sourceBucket) {
+      logger.error(
+        `Refusing to clean up variants for ${filePath}: variants bucket ${variantsBucketName} is the same as the source bucket. Set VARIANTS_BUCKET or use a *.appspot.com bucket.`,
+      );
+      return;
+    }
+
     const variantsBucketRef = storage.bucket(variantsBucketName);
     const basePath = stripExtension(filePath);
 

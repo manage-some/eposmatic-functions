@@ -8,7 +8,9 @@
     "serve": "npm run build && firebase emulators:start --only functions",
     "deploy": "firebase deploy --only functions",
     "logs": "firebase functions:log",
-    "backfill": "npx tsx backfill-variants.ts"
+    "backfill": "npx tsx backfill-variants.ts",
+    "typecheck:backfill": "tsc --noEmit -p tsconfig.backfill.json",
+    "typecheck": "npm run build && npm run typecheck:backfill"
   },
   "engines": {
     "node": "22"
