@@ -206,7 +206,8 @@ async function main() {
       console.error(`  Error: ${filePath}`, err);
     } finally {
       completed++;
-      if (completed % 500 === 0 || completed === imagePaths.length) {
+      // Log once per full concurrency "wave" instead of every 500 files
+      if (completed % CONCURRENCY === 0 || completed === imagePaths.length) {
         console.log(
           `  +${completed}/${imagePaths.length} files (created: ${processed}, skipped: ${totalSkipped}, errors: ${totalErrors})`,
         );
