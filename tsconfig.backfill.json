@@ -12,6 +12,7 @@
     },
     "include": [
         "backfill-variants.ts",
+        "backfill-worker.ts",
         "src/variants.ts"
     ]
 }

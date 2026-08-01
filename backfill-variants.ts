@@ -1,31 +1,47 @@
 import { Storage } from "@google-cloud/storage";
 import PQueue from "p-queue";
-import sharp from "sharp";
+import { Piscina } from "piscina";
 import {
-  LARGE_VARIANT_WIDTH,
   SIZES,
   VARIANT_REGEX,
-  encodeVariant,
   hasExtension,
   lastSegment,
   removeExtensionlessDuplicate,
   stripExtension,
   variantExt,
-  webpEncodeOptions,
 } from "./src/variants.js";
 
 const SOURCE_BUCKET = "prod-managesome.appspot.com";
 const VARIANTS_BUCKET = "prod-managesome-variants";
-const CONCURRENCY = 12;
+const CONCURRENCY = 24;
+
+// Number of encode worker threads. Each worker runs sharp.concurrency(1) (see
+// backfill-worker.ts), so WORKERS == vCPUs to use all cores without
+// oversubscription.
+const WORKERS = 8;
 
 // Uses the VM's default service account (storage-rw scope) — no key file needed
 const storage = new Storage();
 const sourceBucket = storage.bucket(SOURCE_BUCKET);
 const variantsBucket = storage.bucket(VARIANTS_BUCKET);
 
-async function processImage(filePath: string): Promise<number> {
+// Worker-thread pool: heavy sharp encodes run here so the main thread can keep
+// doing GCS I/O (download/upload/exists) while the CPUs stay busy.
+const pool = new Piscina({
+  filename: new URL("./backfill-worker.ts", import.meta.url).href,
+  maxThreads: WORKERS,
+});
+
+type ProcessImageResult = {
+  outcome: "created" | "skipped" | "failed";
+  count: number;
+};
+
+async function processImage(filePath: string): Promise<ProcessImageResult> {
   // Guard: skip anything that looks like a directory or listing entry
-  if (filePath.endsWith("/") || filePath.endsWith(":")) return 0;
+  if (filePath.endsWith("/") || filePath.endsWith(":")) {
+    return { outcome: "skipped", count: 0 };
+  }
 
   // Clean up the old extension-less duplicate of this image (if any). The
   // with-extension file drives the cleanup; the stale extension-less sibling
@@ -56,41 +72,41 @@ async function processImage(filePath: string): Promise<number> {
   // and skip cleanly instead of erroring on download.
   if (!hasExtension(filePath)) {
     const [fileExists] = await sourceBucket.file(filePath).exists();
-    if (!fileExists) return 0;
+    if (!fileExists) return { outcome: "skipped", count: 0 };
   }
 
   // Download original to memory via SDK (no temp files, no root-owned dir issues)
   const [buffer] = await sourceBucket.file(filePath).download();
   if (!buffer || buffer.length === 0) {
-    return 0;
+    return { outcome: "skipped", count: 0 };
   }
 
-  // Read the actual source format (header-only, cheap) and pick encoder
-  // settings that preserve quality for already-compressed inputs.
-  const { format } = await sharp(buffer, {
-    limitInputPixels: 100_000_000,
-  }).metadata();
-
-  // Generate and upload all variants in parallel so encode+upload overlap —
-  // serializing them made each file wait on 4 sequential GCS round-trips and
-  // left the VM's CPU under-utilized. The trigger already does this.
+  // Encode all 4 variants on a piscina worker thread (CPU), then upload them
+  // in parallel (I/O). The main thread stays free for GCS while workers encode.
   let created = 0;
   const succeededPaths: string[] = [];
-  const results = await Promise.allSettled(
-    SIZES.map(async (size) => {
-      const ext = variantExt(filePath);
-      const variantPath = `${basePath}_${size.suffix}${ext}`;
+  const ext = variantExt(filePath);
+  const variantPaths = SIZES.map((size) => `${basePath}_${size.suffix}${ext}`);
 
-      // Preserve source quality; only the largest variant gets a lossy
-      // q85 fallback (keeps whichever is smaller) as a safety net.
-      const { buffer: resizedBuffer } = await encodeVariant(
-        buffer,
-        size,
-        webpEncodeOptions(format),
-        size.width >= LARGE_VARIANT_WIDTH,
-      );
+  // Worker returns Uint8Array (structured clone of the worker's Buffers).
+  let buffers: Uint8Array[] = [];
+  try {
+    buffers = (await pool.run(buffer)) as Uint8Array[];
+  } catch (err) {
+    console.error(`  Encode failed for ${filePath}:`, err);
+    return { outcome: "failed", count: 0 };
+  }
 
-      await variantsBucket.file(variantPath).save(resizedBuffer, {
+  if (buffers.length !== variantPaths.length) {
+    console.error(
+      `  Worker returned ${buffers.length} variant(s) for ${filePath} (expected ${variantPaths.length})`,
+    );
+    return { outcome: "failed", count: 0 };
+  }
+
+  const uploads = await Promise.allSettled(
+    variantPaths.map(async (variantPath, index) => {
+      await variantsBucket.file(variantPath).save(buffers[index], {
         metadata: {
           contentType: "image/webp",
           cacheControl: "public, max-age=31536000",
@@ -100,15 +116,18 @@ async function processImage(filePath: string): Promise<number> {
     }),
   );
 
-  for (const result of results) {
+  for (const result of uploads) {
     if (result.status === "fulfilled") {
       succeededPaths.push(result.value);
       created++;
     } else {
-      console.error(`  Variant failed for ${filePath}:`, result.reason);
+      console.error(
+        `  Variant upload failed for ${filePath}:`,
+        result.reason,
+      );
     }
   }
-  const failedCount = results.length - created;
+  const failedCount = variantPaths.length - created;
 
   // Roll back partial sets so consumers never see a partial group — they
   // fall back to the original via getImageUrl().
@@ -125,7 +144,7 @@ async function processImage(filePath: string): Promise<number> {
         }
       }),
     );
-    created = 0;
+    return { outcome: "failed", count: 0 };
   }
 
   // The source can be deleted while its variants were being written —
@@ -143,11 +162,11 @@ async function processImage(filePath: string): Promise<number> {
       await Promise.allSettled(
         succeededPaths.map((path) => variantsBucket.file(path).delete()),
       );
-      return 0;
+      return { outcome: "skipped", count: 0 };
     }
   }
 
-  return created;
+  return { outcome: "created", count: created };
 }
 
 function isImageFile(name: string): boolean {
@@ -197,16 +216,23 @@ async function main() {
   // (FIFO, so with-extension files still get processed first).
   const queue = new PQueue({ concurrency: CONCURRENCY });
 
-  let processed = 0;
+  let filesWithVariants = 0;
+  let totalVariants = 0;
   let totalSkipped = 0;
   let totalErrors = 0;
   let completed = 0;
 
   const run = async (filePath: string): Promise<void> => {
     try {
-      const count = await processImage(filePath);
-      if (count > 0) processed++;
-      else totalSkipped++;
+      const { outcome, count } = await processImage(filePath);
+      if (outcome === "created") {
+        filesWithVariants++;
+        totalVariants += count;
+      } else if (outcome === "failed") {
+        totalErrors++;
+      } else {
+        totalSkipped++;
+      }
     } catch (err) {
       totalErrors++;
       console.error(`  Error: ${filePath}`, err);
@@ -215,7 +241,7 @@ async function main() {
       // Log once per full concurrency "wave" instead of every 500 files
       if (completed % CONCURRENCY === 0 || completed === imagePaths.length) {
         console.log(
-          `  +${completed}/${imagePaths.length} files (created: ${processed}, skipped: ${totalSkipped}, errors: ${totalErrors})`,
+          `  +${completed}/${imagePaths.length} files (files: ${filesWithVariants}, variants: ${totalVariants}, skipped: ${totalSkipped}, errors: ${totalErrors})`,
         );
       }
     }
@@ -237,9 +263,13 @@ async function main() {
   console.log(`  Total time:          ${totalTime}s`);
   console.log(`  Average rate:        ${avgRate} files/s`);
   console.log(`  Files processed:     ${imagePaths.length}`);
-  console.log(`  Variants created:    ${processed}`);
+  console.log(`  Files with variants: ${filesWithVariants}`);
+  console.log(`  Variants created:    ${totalVariants}`);
   console.log(`  Skipped:             ${totalSkipped}`);
   console.log(`  Errors:              ${totalErrors}`);
+
+  // Shut down worker threads so the process can exit cleanly.
+  await pool.destroy();
 }
 
 main().catch((err) => {
