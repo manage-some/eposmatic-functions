@@ -13,9 +13,13 @@ export const SIZES = [
 
 /**
  * Regex to detect files that are already variants.
- * Matches filenames ending in _{digits}x{digits}.webp
+ * Matches filenames ending in one of the known variant suffixes
+ * (_64x64, _128x128, _256x256, _512x512), with optional .webp.
+ * Restricted to the real sizes so an original named e.g. "foo_300x300"
+ * is not mistaken for a variant and skipped forever.
  */
-export const VARIANT_REGEX = /_\d+x\d+(\.webp)?$/i;
+export const VARIANT_REGEX =
+  /_(?:64x64|128x128|256x256|512x512)(\.webp)?$/i;
 
 /** Size entry with typed fields. */
 export interface SizeConfig {
@@ -106,6 +110,9 @@ export async function removeExtensionlessDuplicate(
 
   const basePath = stripExtension(filePath);
   if (basePath === filePath) return false;
+  // The sibling must be truly extension-less: a multi-dot driver like
+  // "123.v2.webp" would otherwise delete the unrelated file "123.v2".
+  if (hasExtension(basePath)) return false;
 
   // CAUTION: only remove the extension-less sibling if the with-extension
   // file (the one that triggered/was listed) truly exists.
@@ -130,18 +137,21 @@ export async function removeExtensionlessDuplicate(
 export const LARGE_VARIANT_WIDTH = Math.max(...SIZES.map((s) => s.width));
 
 /**
- * Choose WebP encoder settings that PRESERVE the quality that arrived from
- * the admin panel. Quality control is the admin panel's job (client-side
- * compression); this function never adds a second lossy generation.
+ * Choose the WebP encoder mode that best preserves the quality that arrived
+ * from the admin panel. Quality control is the admin panel's job (client-side
+ * compression); this function avoids adding a second lossy generation for
+ * every size except the largest "hero", which also gets a lossy q85 safety
+ * net (see encodeVariant) so it can never exceed a plain lossy encode.
  *
- * - PNG sources (already lossless): keep lossless so pixels stay exact
- *   (crisp for graphics/logos/text at every size).
+ * - PNG sources (already lossless): prefer lossless so pixels stay exact
+ *   (crisp for graphics/logos/text).
  * - WebP, JPEG, TIFF and any other raster source: near-lossless (lossless
  *   mode + preprocessing) preserves the decoded pixels essentially exactly,
  *   so the only size reduction comes from the smaller dimensions.
  *
- * The largest variant additionally keeps a lossy q85 fallback so it can
- * never exceed a plain lossy encode (see encodeVariant).
+ * The hero (largest) variant additionally tries a lossy q85 encode and keeps
+ * whichever of the two is SMALLER, so it is never bigger than a plain lossy
+ * version even when the source was already aggressively compressed.
  */
 export function webpEncodeOptions(
   format: string | undefined,
@@ -179,7 +189,7 @@ export async function encodeVariant(
   isLarge: boolean,
 ): Promise<{ buffer: Buffer; options: sharp.WebpOptions }> {
   const candidates: sharp.WebpOptions[] = [preferred];
-  if (isLarge && preferred.nearLossless) {
+  if (isLarge) {
     candidates.push({ quality: 85, effort: 6, smartSubsample: true });
   }
 

@@ -1,5 +1,6 @@
 import { Storage } from "@google-cloud/storage";
 import sharp from "sharp";
+import PQueue from "p-queue";
 import {
   LARGE_VARIANT_WIDTH,
   SIZES,
@@ -15,7 +16,7 @@ import {
 
 const SOURCE_BUCKET = "prod-managesome.appspot.com";
 const VARIANTS_BUCKET = "prod-managesome-variants";
-const CONCURRENCY = 12;
+const CONCURRENCY = 24;
 
 // Uses the VM's default service account (storage-rw scope) — no key file needed
 const storage = new Storage();
@@ -121,6 +122,25 @@ async function processImage(filePath: string): Promise<number> {
     created = 0;
   }
 
+  // The source can be deleted while its variants were being written —
+  // externally, or by a concurrent with-extension sibling cleanup deleting
+  // a stale extension-less file. cleanupVariants may then have run BEFORE
+  // these writes landed, leaving orphans no future event would ever clean.
+  // If the source is gone, remove what we just wrote (harmless 404s if the
+  // trigger already did).
+  if (created > 0) {
+    const [stillExists] = await sourceBucket.file(filePath).exists();
+    if (!stillExists) {
+      console.warn(
+        `  Source ${filePath} deleted during processing — removing ${created} orphaned variant(s)`,
+      );
+      await Promise.allSettled(
+        succeededPaths.map((path) => variantsBucket.file(path).delete()),
+      );
+      return 0;
+    }
+  }
+
   return created;
 }
 
@@ -152,44 +172,6 @@ async function listAllImages(): Promise<string[]> {
     });
 }
 
-async function processBatch(
-  batch: string[],
-): Promise<{ created: number; skipped: number; errors: number }> {
-  let created = 0;
-  let skipped = 0;
-  let errors = 0;
-
-  const results = await Promise.allSettled(
-    batch.map(async (gcsPath) => {
-      try {
-        const count = await processImage(gcsPath);
-        if (count > 0) return "created";
-        return "skipped";
-      } catch (err) {
-        console.error(`  Error: ${gcsPath}`, err);
-        return "error";
-      }
-    }),
-  );
-
-  for (const r of results) {
-    if (r.status === "fulfilled") {
-      if (r.value === "created") created++;
-      else if (r.value === "error") errors++;
-      else skipped++;
-    } else {
-      errors++;
-    }
-  }
-
-  return { created, skipped, errors };
-}
-
-let processed = 0;
-let totalSkipped = 0;
-let totalErrors = 0;
-let totalFiles = 0;
-
 async function main() {
   console.log(
     `Backfilling variants from ${SOURCE_BUCKET} → ${VARIANTS_BUCKET}`,
@@ -203,29 +185,53 @@ async function main() {
   const imagePaths = await listAllImages();
   console.log(`  Found ${imagePaths.length} images to process`);
 
-  // Process in batches
-  for (let i = 0; i < imagePaths.length; i += CONCURRENCY) {
-    const batch = imagePaths.slice(i, i + CONCURRENCY);
-    const { created, skipped, errors } = await processBatch(batch);
-    processed += created;
-    totalSkipped += skipped;
-    totalErrors += errors;
-    totalFiles += batch.length;
+  // Process through a concurrency-limited queue instead of fixed batches.
+  // Batching waits for the slowest file in every batch; the queue keeps the
+  // pipe full — as soon as one image finishes, the next starts immediately
+  // (FIFO, so with-extension files still get processed first).
+  const queue = new PQueue({ concurrency: CONCURRENCY });
 
-    console.log(
-      `  +${batch.length} files (created: ${processed}, errors: ${totalErrors})`,
-    );
+  let processed = 0;
+  let totalSkipped = 0;
+  let totalErrors = 0;
+  let completed = 0;
+
+  const run = async (filePath: string): Promise<void> => {
+    try {
+      const count = await processImage(filePath);
+      if (count > 0) processed++;
+      else totalSkipped++;
+    } catch (err) {
+      totalErrors++;
+      console.error(`  Error: ${filePath}`, err);
+    } finally {
+      completed++;
+      if (completed % 500 === 0 || completed === imagePaths.length) {
+        console.log(
+          `  +${completed}/${imagePaths.length} files (created: ${processed}, skipped: ${totalSkipped}, errors: ${totalErrors})`,
+        );
+      }
+    }
+  };
+
+  // Enqueue all paths (FIFO order). run() never rejects, so the queue's
+  // internal promise stays resolved and onIdle() fires when everything is done.
+  for (const filePath of imagePaths) {
+    queue.add(() => run(filePath));
   }
 
+  await queue.onIdle();
+
   const totalTime = Math.round((Date.now() - startTime) / 1000);
-  const avgRate = totalTime > 0 ? Math.round(totalFiles / totalTime) : "?";
+  const avgRate =
+    totalTime > 0 ? Math.round(imagePaths.length / totalTime) : "?";
   console.log("");
   console.log("=== Backfill complete ===");
   console.log(`  Total time:          ${totalTime}s`);
   console.log(`  Average rate:        ${avgRate} files/s`);
-  console.log(`  Files processed:     ${totalFiles}`);
+  console.log(`  Files processed:     ${imagePaths.length}`);
   console.log(`  Variants created:    ${processed}`);
-  console.log(`  Skipped (empty):     ${totalSkipped}`);
+  console.log(`  Skipped:             ${totalSkipped}`);
   console.log(`  Errors:              ${totalErrors}`);
 }
 
