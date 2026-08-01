@@ -65,7 +65,7 @@ export const generateImageVariants = onObjectFinalized(
   {
     bucket: SOURCE_BUCKET,
     region: "us-central1",
-    memory: "512MiB",
+    memory: "1GiB",
     timeoutSeconds: 120,
   },
   async (event: StorageEvent) => {

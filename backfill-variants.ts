@@ -16,7 +16,7 @@ import {
 
 const SOURCE_BUCKET = "prod-managesome.appspot.com";
 const VARIANTS_BUCKET = "prod-managesome-variants";
-const CONCURRENCY = 24;
+const CONCURRENCY = 48;
 
 // Uses the VM's default service account (storage-rw scope) — no key file needed
 const storage = new Storage();
@@ -71,13 +71,13 @@ async function processImage(filePath: string): Promise<number> {
     limitInputPixels: 100_000_000,
   }).metadata();
 
-  // Generate and upload variants one at a time so each buffer is
-  // disposed before the next resize
+  // Generate and upload all variants in parallel so encode+upload overlap —
+  // serializing them made each file wait on 4 sequential GCS round-trips and
+  // left the VM's CPU under-utilized. The trigger already does this.
   let created = 0;
   const succeededPaths: string[] = [];
-  let failedCount = 0;
-  for (const size of SIZES) {
-    try {
+  const results = await Promise.allSettled(
+    SIZES.map(async (size) => {
       const ext = variantExt(filePath);
       const variantPath = `${basePath}_${size.suffix}${ext}`;
 
@@ -96,13 +96,19 @@ async function processImage(filePath: string): Promise<number> {
           cacheControl: "public, max-age=31536000",
         },
       });
-      succeededPaths.push(variantPath);
+      return variantPath;
+    }),
+  );
+
+  for (const result of results) {
+    if (result.status === "fulfilled") {
+      succeededPaths.push(result.value);
       created++;
-    } catch (err) {
-      failedCount++;
-      console.error(`  Variant failed for ${filePath} (${size.suffix}):`, err);
+    } else {
+      console.error(`  Variant failed for ${filePath}:`, result.reason);
     }
   }
+  const failedCount = results.length - created;
 
   // Roll back partial sets so consumers never see a partial group — they
   // fall back to the original via getImageUrl().

@@ -18,8 +18,7 @@ export const SIZES = [
  * Restricted to the real sizes so an original named e.g. "foo_300x300"
  * is not mistaken for a variant and skipped forever.
  */
-export const VARIANT_REGEX =
-  /_(?:64x64|128x128|256x256|512x512)(\.webp)?$/i;
+export const VARIANT_REGEX = /_(?:64x64|128x128|256x256|512x512)(\.webp)?$/i;
 
 /** Size entry with typed fields. */
 export interface SizeConfig {
