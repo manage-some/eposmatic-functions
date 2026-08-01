@@ -13,7 +13,9 @@ import sharp from "sharp";
 import {
   describeEncodeMode,
   encodeVariant,
+  hasExtension,
   LARGE_VARIANT_WIDTH,
+  removeExtensionlessDuplicate,
   SIZES,
   stripExtension,
   VARIANT_REGEX,
@@ -55,6 +57,9 @@ function getVariantsBucket(sourceBucket: string): string {
  * - Trigger is scoped to SOURCE_BUCKET only — does NOT listen to variants bucket events.
  * - Reads from source bucket (download, exists check).
  * - Writes ONLY to the variants bucket — never modifies the source bucket.
+ * - MAY delete a stale extension-less duplicate from the source bucket when a
+ *   with-extension file for the same base name exists (its variants are removed
+ *   by the cleanupVariants trigger). See removeExtensionlessDuplicate.
  */
 export const generateImageVariants = onObjectFinalized(
   {
@@ -145,6 +150,30 @@ export const generateImageVariants = onObjectFinalized(
           `Source deleted during processing, skipping variant writes for ${filePath}`,
         );
         return;
+      }
+
+      // Clean up the old extension-less duplicate of this image (if any).
+      // Older uploads were stored without an extension (e.g. "123"); the admin
+      // panel now stores them WITH one (e.g. "123.webp"). Updating an old
+      // item's image can therefore leave a stale "123" next to the new
+      // "123.webp" — remove the extension-less sibling (and its variants) so
+      // the bucket stays free of duplicate paths. Best-effort: variant
+      // generation must proceed even if cleanup fails.
+      if (hasExtension(filePath)) {
+        try {
+          const removed = await removeExtensionlessDuplicate(
+            filePath,
+            sourceBucketRef,
+          );
+          if (removed) {
+            logger.info(`Removed extension-less duplicate of ${filePath}`);
+          }
+        } catch (err) {
+          logger.warn(
+            `Extension-less duplicate cleanup failed for ${filePath}`,
+            err,
+          );
+        }
       }
 
       // Generate all variants in parallel (fit: "inside" preserves aspect ratio)

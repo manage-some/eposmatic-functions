@@ -1,14 +1,16 @@
 import { Storage } from "@google-cloud/storage";
 import sharp from "sharp";
 import {
+  LARGE_VARIANT_WIDTH,
   SIZES,
   VARIANT_REGEX,
+  encodeVariant,
+  hasExtension,
   lastSegment,
+  removeExtensionlessDuplicate,
   stripExtension,
   variantExt,
-  LARGE_VARIANT_WIDTH,
   webpEncodeOptions,
-  encodeVariant,
 } from "./src/variants.js";
 
 const SOURCE_BUCKET = "prod-managesome.appspot.com";
@@ -24,7 +26,37 @@ async function processImage(filePath: string): Promise<number> {
   // Guard: skip anything that looks like a directory or listing entry
   if (filePath.endsWith("/") || filePath.endsWith(":")) return 0;
 
+  // Clean up the old extension-less duplicate of this image (if any). The
+  // with-extension file drives the cleanup; the stale extension-less sibling
+  // and its variants get deleted. Best-effort — failures must not abort the
+  // rest of the backfill.
+  if (hasExtension(filePath)) {
+    try {
+      const removed = await removeExtensionlessDuplicate(
+        filePath,
+        sourceBucket,
+      );
+      if (removed) {
+        console.log(`  Removed extension-less duplicate of ${filePath}`);
+      }
+    } catch (err) {
+      console.error(
+        `  Extension-less duplicate cleanup failed for ${filePath}:`,
+        err,
+      );
+    }
+  }
+
   const basePath = stripExtension(filePath);
+
+  // A with-extension file drives the duplicate cleanup and is never removed by
+  // it, so it must still exist. Only an extension-less file can have been
+  // deleted as a stale sibling by an earlier with-extension file — check those
+  // and skip cleanly instead of erroring on download.
+  if (!hasExtension(filePath)) {
+    const [fileExists] = await sourceBucket.file(filePath).exists();
+    if (!fileExists) return 0;
+  }
 
   // Download original to memory via SDK (no temp files, no root-owned dir issues)
   const [buffer] = await sourceBucket.file(filePath).download();
@@ -107,7 +139,17 @@ function isImageFile(name: string): boolean {
 async function listAllImages(): Promise<string[]> {
   // auto-paginated listing of the ENTIRE bucket (images/, platforms/, rider-app/, ...)
   const [allFiles] = await sourceBucket.getFiles();
-  return allFiles.map((file) => file.name).filter(isImageFile);
+  return allFiles
+    .map((file) => file.name)
+    .filter(isImageFile)
+    .sort((a, b) => {
+      // Process WITH-extension files first so their duplicate cleanup runs
+      // before the extension-less sibling is reached (avoids generating
+      // variants for a file that is about to be deleted).
+      const aExt = hasExtension(a) ? 1 : 0;
+      const bExt = hasExtension(b) ? 1 : 0;
+      return bExt - aExt || a.localeCompare(b);
+    });
 }
 
 async function processBatch(

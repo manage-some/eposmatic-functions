@@ -56,6 +56,73 @@ export function variantExt(sourcePath: string): string {
 }
 
 /**
+ * Image extensions that count as a real "with-extension" upload for duplicate
+ * cleanup purposes. Only these drive the extension-less sibling removal — a
+ * dotted folder (e.g. "thailemon.co.nz") or a dotted non-image filename must
+ * never trigger a delete.
+ */
+const IMAGE_EXTENSIONS = /\.(jpe?g|png|webp|bmp|tiff?|avif)$/i;
+
+/** Whether the LAST path segment carries a real image extension. */
+function hasImageExtension(name: string): boolean {
+  return IMAGE_EXTENSIONS.test(lastSegment(name));
+}
+
+/**
+ * Minimal structural type satisfied by both the Firebase Admin and the
+ * @google-cloud/storage Bucket APIs (both expose file().exists()/.delete()).
+ */
+interface BucketFile {
+  exists(): Promise<[boolean]>;
+  delete(): Promise<unknown>;
+}
+
+export interface BucketLike {
+  file(name: string): BucketFile;
+}
+
+/**
+ * Clean up the old extension-less duplicate of a newly-uploaded image.
+ *
+ * Older uploads were stored WITHOUT an extension (e.g. "123"), while the
+ * admin panel now stores them WITH one (e.g. "123.webp"). When an old item's
+ * image is updated, the new file lands at "123.webp" while the stale "123"
+ * remains — two paths for the same image. This deletes the extension-less
+ * sibling but ONLY when the with-extension file actually exists, so a file is
+ * never removed without a replacement. The sibling's variants need no manual
+ * cleanup here: deleting it from the source bucket fires the deployed
+ * cleanupVariants trigger, which removes them.
+ *
+ * Returns true when a duplicate was removed.
+ */
+export async function removeExtensionlessDuplicate(
+  filePath: string,
+  sourceBucket: BucketLike,
+): Promise<boolean> {
+  // Only the WITH-extension form drives cleanup, and only when the extension
+  // is a real image extension (so dotted folder/file names never trigger a
+  // delete).
+  if (!hasImageExtension(filePath)) return false;
+
+  const basePath = stripExtension(filePath);
+  if (basePath === filePath) return false;
+
+  // CAUTION: only remove the extension-less sibling if the with-extension
+  // file (the one that triggered/was listed) truly exists.
+  const [withExtExists] = await sourceBucket.file(filePath).exists();
+  if (!withExtExists) return false;
+
+  const [duplicateExists] = await sourceBucket.file(basePath).exists();
+  if (!duplicateExists) return false;
+
+  // Delete the stale extension-less source file. Its variants are cleaned up
+  // by the deployed cleanupVariants trigger that fires on this delete.
+  await sourceBucket.file(basePath).delete();
+
+  return true;
+}
+
+/**
  * The largest variant width. Only this "hero" size gets the lossy q85
  * fallback (see encodeVariant) as a safety net; every other size is encoded
  * to preserve the source quality exactly.
