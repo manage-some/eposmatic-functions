@@ -11,11 +11,10 @@ import {
 } from "firebase-functions/v2/storage";
 import sharp from "sharp";
 import {
-  describeEncodeMode,
+  cleanupStaleSiblings,
   encodeVariant,
-  hasExtension,
+  hasSameBaseOriginal,
   LARGE_VARIANT_WIDTH,
-  removeExtensionlessDuplicate,
   SIZES,
   stripExtension,
   VARIANT_REGEX,
@@ -117,10 +116,6 @@ export const generateImageVariants = onObjectFinalized(
     const sourceBucketRef = storage.bucket(sourceBucket);
     const variantsBucketRef = storage.bucket(variantsBucketName);
 
-    logger.info(
-      `Generating variants for ${filePath} (${contentType}) → ${variantsBucketName}`,
-    );
-
     try {
       // Download the original
       const [buffer] = await sourceBucketRef.file(filePath).download();
@@ -137,8 +132,6 @@ export const generateImageVariants = onObjectFinalized(
         limitInputPixels: 100_000_000,
       }).metadata();
 
-      logger.info(`Encoding ${filePath} as ${format ?? "unknown"}`);
-
       // Strip extension from the filename only (preserves dotted dirs)
       const basePath = stripExtension(filePath);
 
@@ -152,28 +145,29 @@ export const generateImageVariants = onObjectFinalized(
         return;
       }
 
-      // Clean up the old extension-less duplicate of this image (if any).
-      // Older uploads were stored without an extension (e.g. "123"); the admin
-      // panel now stores them WITH one (e.g. "123.webp"). Updating an old
-      // item's image can therefore leave a stale "123" next to the new
-      // "123.webp" — remove the extension-less sibling (and its variants) so
-      // the bucket stays free of duplicate paths. Best-effort: variant
-      // generation must proceed even if cleanup fails.
-      if (hasExtension(filePath)) {
-        try {
-          const removed = await removeExtensionlessDuplicate(
-            filePath,
-            sourceBucketRef,
-          );
-          if (removed) {
-            logger.info(`Removed extension-less duplicate of ${filePath}`);
-          }
-        } catch (err) {
-          logger.warn(
-            `Extension-less duplicate cleanup failed for ${filePath}`,
-            err,
+      // Clean up stale same-base siblings of this image (if any): an older
+      // extension-less "123" next to "123.webp", OR an older "123.webp" next
+      // to a newly-uploaded "123.jpeg". Both map to the SAME variant paths,
+      // so a stale sibling's variants clobber the image that was just
+      // uploaded — the "previous image" bug. The file that triggered this run
+      // is NEVER deleted; only siblings provably older are removed. Best-
+      // effort: variant generation proceeds even if cleanup fails. The deleted
+      // siblings' variants are not wiped because the cleanupVariants trigger
+      // skips while a same-base image still exists.
+      try {
+        const removed = await cleanupStaleSiblings(
+          filePath,
+          sourceBucketRef,
+          object.updated,
+          object.generation,
+        );
+        if (removed.length > 0) {
+          logger.info(
+            `Removed stale same-base original(s) for ${filePath}: ${removed.join(", ")}`,
           );
         }
+      } catch (err) {
+        logger.warn(`Stale sibling cleanup failed for ${filePath}`, err);
       }
 
       // Generate all variants in parallel (fit: "inside" preserves aspect ratio)
@@ -185,13 +179,12 @@ export const generateImageVariants = onObjectFinalized(
 
           // Preserve source quality; only the largest variant gets a lossy
           // q85 fallback (keeps whichever is smaller) as a safety net.
-          const { buffer: resizedBuffer, options: usedOptions } =
-            await encodeVariant(
-              buffer,
-              size,
-              webpEncodeOptions(format),
-              size.width >= LARGE_VARIANT_WIDTH,
-            );
+          const { buffer: resizedBuffer } = await encodeVariant(
+            buffer,
+            size,
+            webpEncodeOptions(format),
+            size.width >= LARGE_VARIANT_WIDTH,
+          );
 
           await variantsBucketRef.file(variantPath).save(resizedBuffer, {
             metadata: {
@@ -199,10 +192,6 @@ export const generateImageVariants = onObjectFinalized(
               cacheControl: object.cacheControl || "public, max-age=31536000",
             },
           });
-
-          logger.info(
-            `Created variant: ${variantPath} (${describeEncodeMode(usedOptions)})`,
-          );
 
           return variantPath;
         }),
@@ -292,6 +281,26 @@ export const cleanupVariants = onObjectDeleted(
       return;
     }
 
+    // Precision guard: the deleted file may have been a stale same-base
+    // sibling removed by generateImageVariants (e.g. "123.webp" removed when
+    // "123.jpeg" was uploaded). Both share the SAME variant paths, so if a
+    // same-base original still exists we must NOT delete those variants — the
+    // surviving file's finalized trigger owns (and has just rewritten) them.
+    // Deleting them here would leave the surviving image with no variants and
+    // break client-side image fetches.
+    if (
+      await hasSameBaseOriginal(
+        stripExtension(filePath),
+        filePath,
+        storage.bucket(sourceBucket),
+      )
+    ) {
+      logger.debug(
+        `Same-base original still exists for ${filePath}, skipping variant cleanup`,
+      );
+      return;
+    }
+
     const variantsBucketName = getVariantsBucket(sourceBucket);
 
     // Guard: never touch the source bucket during cleanup. If the derived
@@ -306,10 +315,6 @@ export const cleanupVariants = onObjectDeleted(
 
     const variantsBucketRef = storage.bucket(variantsBucketName);
     const basePath = stripExtension(filePath);
-
-    logger.info(
-      `Cleaning up variants for deleted file: ${filePath} from ${variantsBucketName}`,
-    );
 
     // Delete all variant files in parallel (ignore 404s)
     const results = await Promise.allSettled(
