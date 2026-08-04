@@ -4,9 +4,7 @@ import { Piscina } from "piscina";
 import {
   SIZES,
   VARIANT_REGEX,
-  hasExtension,
   lastSegment,
-  removeExtensionlessDuplicate,
   stripExtension,
   variantExt,
 } from "./src/variants.js";
@@ -20,255 +18,275 @@ const CONCURRENCY = 24;
 // oversubscription.
 const WORKERS = 8;
 
-// Uses the VM's default service account (storage-rw scope) — no key file needed
+// Uses the VM's default service account (storage-rw scope) — no key file needed.
 const storage = new Storage();
 const sourceBucket = storage.bucket(SOURCE_BUCKET);
 const variantsBucket = storage.bucket(VARIANTS_BUCKET);
 
-// Worker-thread pool: heavy sharp encodes run here so the main thread can keep
-// doing GCS I/O (download/upload/exists) while the CPUs stay busy.
-const pool = new Piscina({
-  filename: new URL("./backfill-worker.ts", import.meta.url).href,
-  maxThreads: WORKERS,
-});
+/** Image extensions that count as a real with-extension upload. */
+const IMAGE_EXT = /\.(jpe?g|png|webp|bmp|tiff?|avif)$/i;
 
-type ProcessImageResult = {
-  outcome: "created" | "skipped" | "failed";
-  count: number;
+/** A source-bucket original image (with-extension or extensionless). */
+type Original = {
+  path: string;
+  updated?: string;
+  generation?: string | number;
+  contentType?: string | null;
 };
 
-async function processImage(filePath: string): Promise<ProcessImageResult> {
-  // Guard: skip anything that looks like a directory or listing entry
-  if (filePath.endsWith("/") || filePath.endsWith(":")) {
-    return { outcome: "skipped", count: 0 };
-  }
+/** A base with sibling collisions that needs cleanup + a variant rewrite. */
+type AffectedBase = {
+  base: string;
+  keeper: Original;
+  staleSiblings: string[];
+  variantPaths: string[];
+};
 
-  // Clean up the old extension-less duplicate of this image (if any). The
-  // with-extension file drives the cleanup; the stale extension-less sibling
-  // and its variants get deleted. Best-effort — failures must not abort the
-  // rest of the backfill.
-  if (hasExtension(filePath)) {
-    try {
-      const removed = await removeExtensionlessDuplicate(
-        filePath,
-        sourceBucket,
-      );
-      if (removed) {
-        console.log(`  Removed extension-less duplicate of ${filePath}`);
-      }
-    } catch (err) {
-      console.error(
-        `  Extension-less duplicate cleanup failed for ${filePath}:`,
-        err,
-      );
-    }
-  }
-
-  const basePath = stripExtension(filePath);
-
-  // A with-extension file drives the duplicate cleanup and is never removed by
-  // it, so it must still exist. Only an extension-less file can have been
-  // deleted as a stale sibling by an earlier with-extension file — check those
-  // and skip cleanly instead of erroring on download.
-  if (!hasExtension(filePath)) {
-    const [fileExists] = await sourceBucket.file(filePath).exists();
-    if (!fileExists) return { outcome: "skipped", count: 0 };
-  }
-
-  // Download original to memory via SDK (no temp files, no root-owned dir issues)
-  const [buffer] = await sourceBucket.file(filePath).download();
-  if (!buffer || buffer.length === 0) {
-    return { outcome: "skipped", count: 0 };
-  }
-
-  // Encode all 4 variants on a piscina worker thread (CPU), then upload them
-  // in parallel (I/O). The main thread stays free for GCS while workers encode.
-  let created = 0;
-  const succeededPaths: string[] = [];
-  const ext = variantExt(filePath);
-  const variantPaths = SIZES.map((size) => `${basePath}_${size.suffix}${ext}`);
-
-  // Worker returns Uint8Array (structured clone of the worker's Buffers).
-  let buffers: Uint8Array[] = [];
-  try {
-    buffers = (await pool.run(buffer)) as Uint8Array[];
-  } catch (err) {
-    console.error(`  Encode failed for ${filePath}:`, err);
-    return { outcome: "failed", count: 0 };
-  }
-
-  if (buffers.length !== variantPaths.length) {
-    console.error(
-      `  Worker returned ${buffers.length} variant(s) for ${filePath} (expected ${variantPaths.length})`,
-    );
-    return { outcome: "failed", count: 0 };
-  }
-
-  const uploads = await Promise.allSettled(
-    variantPaths.map(async (variantPath, index) => {
-      await variantsBucket.file(variantPath).save(buffers[index], {
-        metadata: {
-          contentType: "image/webp",
-          cacheControl: "public, max-age=31536000",
-        },
-      });
-      return variantPath;
-    }),
-  );
-
-  for (const result of uploads) {
-    if (result.status === "fulfilled") {
-      succeededPaths.push(result.value);
-      created++;
-    } else {
-      console.error(
-        `  Variant upload failed for ${filePath}:`,
-        result.reason,
-      );
-    }
-  }
-  const failedCount = variantPaths.length - created;
-
-  // Roll back partial sets so consumers never see a partial group — they
-  // fall back to the original via getImageUrl().
-  if (failedCount > 0 && succeededPaths.length > 0) {
-    console.warn(
-      `  Rolling back ${succeededPaths.length} variant(s) for ${filePath} after ${failedCount} failure(s)`,
-    );
-    await Promise.allSettled(
-      succeededPaths.map(async (path) => {
-        try {
-          await variantsBucket.file(path).delete();
-        } catch {
-          // 404 or other delete error — non-critical at this point
-        }
-      }),
-    );
-    return { outcome: "failed", count: 0 };
-  }
-
-  // The source can be deleted while its variants were being written —
-  // externally, or by a concurrent with-extension sibling cleanup deleting
-  // a stale extension-less file. cleanupVariants may then have run BEFORE
-  // these writes landed, leaving orphans no future event would ever clean.
-  // If the source is gone, remove what we just wrote (harmless 404s if the
-  // trigger already did).
-  if (created > 0) {
-    const [stillExists] = await sourceBucket.file(filePath).exists();
-    if (!stillExists) {
-      console.warn(
-        `  Source ${filePath} deleted during processing — removing ${created} orphaned variant(s)`,
-      );
-      await Promise.allSettled(
-        succeededPaths.map((path) => variantsBucket.file(path).delete()),
-      );
-      return { outcome: "skipped", count: 0 };
-    }
-  }
-
-  return { outcome: "created", count: created };
-}
-
-function isImageFile(name: string): boolean {
-  if (!name) return false;
-  if (name.endsWith("/")) return false;
+/**
+ * Whether a source-bucket file is an original image we manage (with an image
+ * extension, or extensionless legacy). Variants are always excluded.
+ */
+function isImageOriginalFile(name: string): boolean {
+  if (!name || name.endsWith("/") || name.endsWith(":")) return false;
   if (VARIANT_REGEX.test(name)) return false;
   const filename = lastSegment(name);
-  const hasImageExt = /\.(jpg|jpeg|png|webp|bmp|tiff|tif|avif)$/i.test(
-    filename,
-  );
-  const hasNoExt = !filename.includes(".");
-  return hasImageExt || hasNoExt;
+  return IMAGE_EXT.test(filename) || !filename.includes(".");
 }
 
-async function listAllImages(): Promise<string[]> {
-  // auto-paginated listing of the ENTIRE bucket (images/, platforms/, rider-app/, ...)
-  const [allFiles] = await sourceBucket.getFiles();
-  return allFiles
-    .map((file) => file.name)
-    .filter(isImageFile)
-    .sort((a, b) => {
-      // Process WITH-extension files first so their duplicate cleanup runs
-      // before the extension-less sibling is reached (avoids generating
-      // variants for a file that is about to be deleted).
-      const aExt = hasExtension(a) ? 1 : 0;
-      const bExt = hasExtension(b) ? 1 : 0;
-      return bExt - aExt || a.localeCompare(b);
-    });
+function parseTime(updated?: string): number {
+  return updated ? Date.parse(updated) : NaN;
 }
 
-async function main() {
-  console.log(
-    `Backfilling variants from ${SOURCE_BUCKET} → ${VARIANTS_BUCKET}`,
-  );
-  console.log(`Concurrency: ${CONCURRENCY}`);
-  console.log("");
+function genNum(generation?: string | number): number | undefined {
+  return generation !== undefined ? Number(generation) : undefined;
+}
+
+/** True when `a` is newer than `b` by (`updated`, `generation` tiebreak). */
+function isNewerThan(
+  a: { updated?: string; generation?: string | number },
+  b: { updated?: string; generation?: string | number },
+): boolean {
+  const at = parseTime(a.updated);
+  const bt = parseTime(b.updated);
+  if (Number.isNaN(at)) return false; // unreadable → cannot be newer
+  if (Number.isNaN(bt)) return true; // b unreadable, a readable → a is newer
+  if (at !== bt) return at > bt;
+  const ag = genNum(a.generation);
+  const bg = genNum(b.generation);
+  if (ag !== undefined && bg !== undefined) return ag > bg;
+  return false;
+}
+
+/** True when `o` is provably older than the keeper (both timestamps readable). */
+function isProvablyOlder(o: Original, keeper: Original): boolean {
+  const ot = parseTime(o.updated);
+  const kt = parseTime(keeper.updated);
+  if (Number.isNaN(ot) || Number.isNaN(kt)) return false;
+  if (ot < kt) return true;
+  if (ot === kt) {
+    const og = genNum(o.generation);
+    const kg = genNum(keeper.generation);
+    if (og !== undefined && kg !== undefined && og < kg) return true;
+  }
+  return false;
+}
+
+/**
+ * Pick the LATEST eligible original as the surviving source for a base, or null
+ * when no original has a readable timestamp (precision-first: never decide on
+ * uncertain data). Mirrors the deployed trigger's cleanup rules.
+ */
+function pickKeeper(originals: Original[]): Original | null {
+  let keeper: Original | null = null;
+  for (const o of originals) {
+    if (!isImageOriginalFile(o.path)) continue;
+    if (o.contentType && !o.contentType.startsWith("image/")) continue;
+    if (Number.isNaN(parseTime(o.updated))) continue; // must be readable
+    if (!keeper || isNewerThan(o, keeper)) keeper = o;
+  }
+  return keeper;
+}
+
+async function main(): Promise<void> {
+  console.log(`Reconciling sibling-collision bases in ${SOURCE_BUCKET}`);
 
   const startTime = Date.now();
 
-  console.log("Listing images from entire source bucket...");
-  const imagePaths = await listAllImages();
-  console.log(`  Found ${imagePaths.length} images to process`);
+  // Only the SOURCE bucket is needed: variants are always present and correctly
+  // named. The only problem to fix is when a base has MORE THAN ONE original
+  // (same base, different extension, or extensionless) — their shared variant
+  // paths may have been written from the wrong (older) sibling. Only those
+  // bases are touched: stale siblings are deleted and the 4 variants are
+  // rewritten from the LATEST source.
+  const [srcFiles] = await sourceBucket.getFiles();
+  console.log(`Listed ${srcFiles.length} source object(s)`);
 
-  // Process through a concurrency-limited queue instead of fixed batches.
-  // Batching waits for the slowest file in every batch; the queue keeps the
-  // pipe full — as soon as one image finishes, the next starts immediately
-  // (FIFO, so with-extension files still get processed first).
-  const queue = new PQueue({ concurrency: CONCURRENCY });
-
-  let filesWithVariants = 0;
-  let totalVariants = 0;
-  let totalSkipped = 0;
-  let totalErrors = 0;
-  let completed = 0;
-
-  const run = async (filePath: string): Promise<void> => {
-    try {
-      const { outcome, count } = await processImage(filePath);
-      if (outcome === "created") {
-        filesWithVariants++;
-        totalVariants += count;
-      } else if (outcome === "failed") {
-        totalErrors++;
-      } else {
-        totalSkipped++;
-      }
-    } catch (err) {
-      totalErrors++;
-      console.error(`  Error: ${filePath}`, err);
-    } finally {
-      completed++;
-      // Log once per full concurrency "wave" instead of every 500 files
-      if (completed % CONCURRENCY === 0 || completed === imagePaths.length) {
-        console.log(
-          `  +${completed}/${imagePaths.length} files (files: ${filesWithVariants}, variants: ${totalVariants}, skipped: ${totalSkipped}, errors: ${totalErrors})`,
-        );
-      }
-    }
-  };
-
-  // Enqueue all paths (FIFO order). run() never rejects, so the queue's
-  // internal promise stays resolved and onIdle() fires when everything is done.
-  for (const filePath of imagePaths) {
-    queue.add(() => run(filePath));
+  // Group source originals by base name (before the extension).
+  const originalsByBase = new Map<string, Original[]>();
+  for (const f of srcFiles) {
+    if (!isImageOriginalFile(f.name)) continue;
+    const base = stripExtension(f.name);
+    const arr = originalsByBase.get(base) ?? [];
+    arr.push({
+      path: f.name,
+      updated: f.metadata?.updated,
+      generation: f.metadata?.generation,
+      contentType: f.metadata?.contentType ?? null,
+    });
+    originalsByBase.set(base, arr);
   }
 
-  await queue.onIdle();
+  // Only bases with >1 original have sibling collisions.
+  const affected: AffectedBase[] = [];
+  let skipped = 0;
+  for (const [base, originals] of originalsByBase) {
+    if (originals.length < 2) continue; // no siblings — variants are fine
+
+    const keeper = pickKeeper(originals);
+    if (!keeper) {
+      skipped++;
+      console.log(
+        `  SKIP ${base}: ${originals.length} sibling(s) but no readable timestamp — left untouched`,
+      );
+      continue;
+    }
+
+    const staleSiblings = originals
+      .filter((o) => o !== keeper)
+      .filter((o) => isImageOriginalFile(o.path))
+      .filter((o) => !(o.contentType && !o.contentType.startsWith("image/")))
+      .filter((o) => isProvablyOlder(o, keeper))
+      .map((o) => o.path);
+
+    const variantPaths = SIZES.map(
+      (s) => `${base}_${s.suffix}${variantExt(keeper.path)}`,
+    );
+
+    affected.push({ base, keeper, staleSiblings, variantPaths });
+  }
+
+  // Report the plan.
+  console.log(
+    `\nBases with sibling collisions needing fixes: ${affected.length}`,
+  );
+  if (skipped > 0) {
+    console.log(`Skipped (unreadable timestamps):             ${skipped}`);
+  }
+  for (const a of affected) {
+    console.log(`\n  base: ${a.base}`);
+    console.log(`    keeper: ${a.keeper.path}`);
+    if (a.staleSiblings.length > 0) {
+      console.log(`    delete: ${a.staleSiblings.join(", ")}`);
+    }
+    console.log(`    rewrite variants: ${a.variantPaths.join(", ")}`);
+  }
+
+  // ===== Apply =====
+  const pool = new Piscina({
+    filename: new URL("./backfill-worker.ts", import.meta.url).href,
+    maxThreads: WORKERS,
+  });
+
+  if (affected.length > 0) {
+    const queue = new PQueue({ concurrency: CONCURRENCY });
+    let done = 0;
+    let rewritten = 0;
+    let errors = 0;
+
+    const run = async (task: AffectedBase): Promise<void> => {
+      try {
+        const [buffer] = await sourceBucket.file(task.keeper.path).download();
+        if (!buffer || buffer.length === 0) {
+          console.error(`  Empty source for ${task.keeper.path}`);
+          errors++;
+          return;
+        }
+        // The keeper may have been deleted while we were downloading.
+        const [stillExists] = await sourceBucket
+          .file(task.keeper.path)
+          .exists();
+        if (!stillExists) {
+          console.warn(`  Source gone for ${task.keeper.path}, skipping`);
+          return;
+        }
+        const buffers = (await pool.run(buffer)) as Buffer[];
+        if (buffers.length !== task.variantPaths.length) {
+          console.error(
+            `  Worker returned ${buffers.length} buffer(s) for ${task.base} (expected ${task.variantPaths.length})`,
+          );
+          errors++;
+          return;
+        }
+        // Rewrite ALL variants for this base from the latest source.
+        const uploads = await Promise.allSettled(
+          task.variantPaths.map((path, i) =>
+            variantsBucket
+              .file(path)
+              .save(buffers[i], {
+                metadata: {
+                  contentType: "image/webp",
+                  cacheControl: "public, max-age=31536000",
+                },
+              })
+              .then(() => path),
+          ),
+        );
+        const ok = uploads.filter((r) => r.status === "fulfilled");
+        const bad = uploads.filter((r) => r.status === "rejected");
+        if (bad.length > 0 && ok.length > 0) {
+          // Roll back the partial set so consumers never see a partial group.
+          console.warn(
+            `  Rolling back ${ok.length} variant(s) for ${task.base} after ${bad.length} failure(s)`,
+          );
+          await Promise.allSettled(
+            ok.map((r) =>
+              variantsBucket
+                .file((r as PromiseFulfilledResult<string>).value)
+                .delete(),
+            ),
+          );
+          errors++;
+          return;
+        }
+        rewritten += ok.length;
+        console.log(
+          `  + ${task.base}: ${ok.length} variant(s) from ${task.keeper.path}`,
+        );
+      } catch (err) {
+        errors++;
+        console.error(`  Error on ${task.base}:`, err);
+      } finally {
+        done++;
+        if (done % CONCURRENCY === 0 || done === affected.length) {
+          console.log(
+            `  +${done}/${affected.length} bases (variants: ${rewritten}, errors: ${errors})`,
+          );
+        }
+      }
+    };
+
+    for (const task of affected) queue.add(() => run(task));
+    await queue.onIdle();
+
+    // Delete stale siblings AFTER variants are correct, so the deployed
+    // cleanupVariants trigger (which skips when the keeper exists) never
+    // wipes the just-rewritten shared variant paths.
+    const allStale = affected.flatMap((a) => a.staleSiblings);
+    if (allStale.length > 0) {
+      console.log(`\nDeleting ${allStale.length} stale same-base sibling(s)...`);
+      const results = await Promise.allSettled(
+        allStale.map((p) => sourceBucket.file(p).delete()),
+      );
+      const ok = results.filter((r) => r.status === "fulfilled").length;
+      console.log(`  Deleted ${ok}/${allStale.length}`);
+    }
+  }
 
   const totalTime = Math.round((Date.now() - startTime) / 1000);
-  const avgRate =
-    totalTime > 0 ? Math.round(imagePaths.length / totalTime) : "?";
-  console.log("");
-  console.log("=== Backfill complete ===");
-  console.log(`  Total time:          ${totalTime}s`);
-  console.log(`  Average rate:        ${avgRate} files/s`);
-  console.log(`  Files processed:     ${imagePaths.length}`);
-  console.log(`  Files with variants: ${filesWithVariants}`);
-  console.log(`  Variants created:    ${totalVariants}`);
-  console.log(`  Skipped:             ${totalSkipped}`);
-  console.log(`  Errors:              ${totalErrors}`);
+  console.log("\n=== Reconcile complete ===");
+  console.log(`  Total time:        ${totalTime}s`);
+  console.log(`  Bases rewritten:   ${affected.length}`);
 
-  // Shut down worker threads so the process can exit cleanly.
   await pool.destroy();
 }
 
